@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from jandax.core import DataFrame
+from jandax.utils import to_datetime, to_strings
 
 
 # Setup fixtures for common test data
@@ -177,18 +178,20 @@ def test_mixed_type_operations():
     df = DataFrame({"A": [1, 2, 3, 4, 5], "B": ["a", "b", "c", "d", "e"]})
 
     # Add string prefix to categorical column
-    new_strings = [f"prefix_{s}" for s in df["B"].to_strings()]
+    category_map = df._column_metadata["B"]["category_map"]
+    new_strings = [f"prefix_{s}" for s in to_strings(df["B"], category_map)]
     df["B"] = new_strings
 
     # Check the result
     expected = ["prefix_a", "prefix_b", "prefix_c", "prefix_d", "prefix_e"]
-    assert list(df["B"].to_strings()) == expected
+    category_map = df._column_metadata["B"]["category_map"]
+    assert list(to_strings(df["B"], category_map)) == expected
 
 
 def test_datetime_operations(date_df):
     """Test operations with datetime columns."""
     # Extract year from datetime column
-    dt_values = date_df["date"].to_datetime()
+    dt_values = to_datetime(date_df["date"])
     years = [dt.year for dt in dt_values]
     date_df["year"] = years
 

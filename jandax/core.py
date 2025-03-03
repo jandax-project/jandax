@@ -1,10 +1,12 @@
 import datetime
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
+
+from jandax.utils import ns_to_pd_datetime
 
 jax.config.update("jax_enable_x64", True)
 
@@ -14,60 +16,15 @@ CATEGORY_TYPE_FLAG = "category"
 NS_PER_DAY = 24 * 60 * 60 * 1_000_000_000  # nanoseconds in a day
 
 
-# Utility functions for datetime handling
-def pd_datetime_to_ns(dt_values):
-    """Convert pandas datetime values to nanoseconds since epoch."""
-    if isinstance(dt_values, pd.DatetimeIndex):
-        # Convert DatetimeIndex to nanoseconds directly and ensure we return a numpy array
-        return np.array(dt_values.astype(np.int64))
-    elif isinstance(dt_values, pd.Series) and pd.api.types.is_datetime64_any_dtype(
-        dt_values.dtype
-    ):
-        # Convert datetime Series to nanoseconds
-        return np.array(dt_values.astype(np.int64))
-    elif isinstance(dt_values, np.ndarray) and np.issubdtype(
-        dt_values.dtype, np.datetime64
-    ):
-        # Convert numpy datetime array to nanoseconds
-        return dt_values.astype(np.int64)
-    else:
-        # Try to convert to pd.DatetimeIndex first, then to nanoseconds
-        try:
-            return np.array(pd.DatetimeIndex(dt_values).astype(np.int64))
-        except:
-            raise ValueError(
-                f"Cannot convert values of type {type(dt_values)} to datetime nanoseconds"
-            )
-
-
-def ns_to_pd_datetime(ns_values):
-    """Convert nanosecond values to pandas datetime."""
-    # Handle JAX arrays specifically
-    if isinstance(ns_values, jax.Array):
-        ns_values = np.array(ns_values)
-
-    # Attempt conversion, ensuring values are properly interpreted
-    try:
-        # Force int64 conversion first, then convert with UTC timezone
-        return pd.to_datetime(ns_values.astype(np.int64), unit="ns")
-    except:
-        # For individual values or problem cases, convert one by one
-        if hasattr(ns_values, "__len__") and len(ns_values) > 0:
-            result = []
-            for val in ns_values:
-                try:
-                    dt = pd.Timestamp(val, unit="ns")
-                    result.append(dt)
-                except:
-                    result.append(pd.NaT)
-            return pd.DatetimeIndex(result)
-        return pd.NaT
-
-
 class DataFrame:
     """A DataFrame-like container backed by a single JAX 2D array."""
 
-    def __init__(self, data, columns=None, include_index=True):
+    def __init__(
+        self,
+        data: Union[pd.DataFrame, np.ndarray, jax.Array, Dict[str, Any]],
+        columns: Optional[List[str]] = None,
+        include_index: bool = True,
+    ):
         """
         Initialize a JaxDataFrame from various data sources.
 
@@ -84,7 +41,7 @@ class DataFrame:
         self._column_metadata = {}
 
         # Initialize storage for our data
-        self._values = None
+        self._values = jnp.zeros((0, 0))
         self._column_names = []
         self._column_mapping = {}  # Maps column name to column index
 
@@ -95,9 +52,10 @@ class DataFrame:
             self._init_from_pandas(data, include_index)
 
         # Handle 2D numpy arrays or JAX arrays
-        elif isinstance(data, (np.ndarray, jax.Array)) and data.ndim == 2:
+        elif isinstance(data, (np.ndarray, jax.Array)) and data.ndim == 2:  # noqa: PLR2004
             # NON-TRACEABLE SECTION: Array handling
             # This branch involves array-specific operations and is not traceable.
+            assert columns is not None
             self._init_from_array(data, columns)
 
         # Handle another JaxDataFrame (copy)
@@ -114,9 +72,14 @@ class DataFrame:
 
         else:
             raise TypeError(
-                f"JaxDataFrame can only be initialized from pandas DataFrame, 2D arrays, "
-                f"another JaxDataFrame, or a dict of arrays. Got {type(data)}"
+                f"""JaxDataFrame can only be initialized from pandas DataFrame,
+                    2D arrays,another JaxDataFrame, or a dict of arrays. 
+                    Got {type(data)}"""
             )
+
+        # Verify initialization succeeded
+        if not isinstance(self._values, jax.Array):
+            raise ValueError("Failed to initialize DataFrame values properly")
 
     def _init_from_pandas(self, df: pd.DataFrame, include_index: bool):
         """Initialize from pandas DataFrame."""
@@ -184,7 +147,8 @@ class DataFrame:
                 self._column_metadata[col_name] = {"dtype_flag": None}
 
         # Stack all columns into a single 2D array
-        # Note: we stack columns horizontally (axis=1) to create a 2D array with shape (n_rows, n_cols)
+        # Note: we stack columns horizontally (axis=1) to create a 2D array with shape
+        # (n_rows, n_cols)
         self._values = jnp.column_stack(column_arrays)
 
     def _init_from_array(self, array: Union[np.ndarray, jax.Array], columns: List[str]):
@@ -228,7 +192,7 @@ class DataFrame:
         for col_name, metadata in df._column_metadata.items():
             self._column_metadata[col_name] = metadata.copy()
 
-    def _init_from_dict(self, data_dict: Dict[str, Any]):
+    def _init_from_dict(self, data_dict: Dict[str, Any]):  # noqa: PLR0912, PLR0915
         """Initialize from a dictionary of arrays."""
         # NON-TRACEABLE SECTION: Dictionary initialization
         # These operations involve dictionary-specific operations and are not traceable.
@@ -247,18 +211,19 @@ class DataFrame:
         for col_name, values in data_dict.items():
             # Convert to numpy array if needed
             if isinstance(values, list):
-                values = np.array(values)
+                values = np.array(values)  # noqa: PLW2901
             elif isinstance(values, jax.Array):
-                values = np.array(values)
+                values = np.array(values)  # noqa: PLW2901
             elif isinstance(values, pd.DatetimeIndex):
                 # Handle DatetimeIndex by converting to nanosecond values
-                values = values.values
+                values = values.values  # noqa: PLW2901
 
             if array_length is None:
                 array_length = len(values)
             elif len(values) != array_length:
                 raise ValueError(
-                    f"All arrays must have the same length. Column '{col_name}' has length {len(values)}, expected {array_length}"
+                    f"""All arrays must have the same length. Column '{col_name}' has 
+                    length {len(values)}, expected {array_length}"""
                 )
 
         # If no data was provided
@@ -282,7 +247,7 @@ class DataFrame:
                     }
                 elif pd.api.types.is_string_dtype(
                     values.dtype
-                ) or pd.api.types.is_categorical_dtype(values.dtype):
+                ) or pd.api.types.is_categorical_dtype(values.dtype):  # type: ignore
                     # Convert to categorical integers
                     categories = values.astype("category").cat.categories.tolist()
                     codes = values.astype("category").cat.codes.values
@@ -348,7 +313,7 @@ class DataFrame:
                 ):
                     # Convert datetime objects to int64 nanoseconds
                     dt_index = pd.DatetimeIndex([x for x in values if x is not None])
-                    int_values = np.array([x.astype(np.int64) for x in dt_index])
+                    int_values = np.array([x.astype(np.int64) for x in dt_index])  # type: ignore
 
                     # Create array with NaT placeholders for None values
                     full_array = np.full(len(values), pd.NaT.value, dtype=np.int64)
@@ -382,40 +347,38 @@ class DataFrame:
         )
 
     @property
-    def columns(self):
+    def columns(self) -> List[str]:
         """Get the column names."""
         # NON-TRACEABLE SECTION: Column name access
         # This operation involves accessing a list and is not traceable.
         return self._column_names.copy()
 
     @property
-    def shape(self):
+    def shape(self) -> tuple:
         """Get the shape of the dataframe."""
         # TRACEABLE SECTION: Shape access
         # This operation accesses a JAX array property and is traceable.
         return self._values.shape
 
     @property
-    def values(self):
+    def values(self) -> jax.Array:
         """Get the underlying 2D JAX array."""
         # TRACEABLE SECTION: Value access
         # This operation returns a JAX array and is traceable.
         return self._values
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: Union[str, List[str]]) -> Union[jax.Array, "DataFrame"]:
         """Column access with explicit tracing phases."""
         # Phase 1: Pre-processing (non-traceable)
         if isinstance(key, str):
             if key not in self._column_mapping:
                 raise KeyError(f"Column '{key}' not found")
             col_idx = self._column_mapping[key]
-            metadata = self._column_metadata[key]
 
             # Phase 2: Core computation (traceable)
             values = self._getitem_single_core(self._values, col_idx)
-
             # Phase 3: Post-processing (non-traceable)
-            return self._wrap_column_array(values, metadata)
+            return values
 
         elif isinstance(key, list):
             if not all(k in self._column_mapping for k in key):
@@ -437,7 +400,7 @@ class DataFrame:
         else:
             raise TypeError(f"Unsupported key type: {type(key)}")
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: Any):
         """Column assignment with explicit tracing phases."""
         # Phase 1: Pre-processing (non-traceable)
         if key in self._column_mapping:
@@ -454,19 +417,23 @@ class DataFrame:
             self.add_column(key, value)
 
     # Keep these core traceable functions and helpers:
-    def _getitem_single_core(self, values, col_idx):
+    def _getitem_single_core(self, values: jax.Array, col_idx: int) -> jax.Array:
         """Pure JAX function for single column access."""
         return values[:, col_idx]
 
-    def _getitem_multiple_core(self, values, col_indices):
+    def _getitem_multiple_core(
+        self, values: jax.Array, col_indices: jax.Array
+    ) -> jax.Array:
         """Pure JAX function for multiple column access."""
         return values[:, col_indices]
 
-    def _setitem_core(self, values, col_idx, new_values):
+    def _setitem_core(
+        self, values: jax.Array, col_idx: int, new_values: jax.Array
+    ) -> jax.Array:
         """Pure JAX function for column assignment."""
         return values.at[:, col_idx].set(new_values)
 
-    def add_column(self, col_name, value):
+    def add_column(self, col_name: str, value: Any):
         """
         Add a new column to the dataframe (non-traceable).
         This method is explicitly non-traceable as it changes the shape
@@ -501,24 +468,9 @@ class DataFrame:
             # Stack new column (creates new array)
             self._values = jnp.column_stack([old_values, value_array])
 
-    def _wrap_column_array(self, values, metadata):
-        """Non-traceable helper to add metadata accessors to column arrays."""
-        values.values = values
-        if metadata["dtype_flag"] == DATETIME_TYPE_FLAG:
-            values.to_datetime = lambda: ns_to_pd_datetime(values)
-        elif metadata["dtype_flag"] == CATEGORY_TYPE_FLAG:
-            category_map = metadata["category_map"]
-            values.to_strings = lambda: pd.Series(
-                [
-                    category_map.get(int(x), None)
-                    if x >= 0 and not jnp.isnan(x)
-                    else None
-                    for x in values
-                ]
-            )
-        return values
-
-    def _prepare_column_values(self, col_name, value, metadata):
+    def _prepare_column_values(
+        self, col_name: str, value: Any, metadata: Dict[str, Any]
+    ) -> jax.Array:
         """
         Helper method to prepare column values for assignment.
         Handles type conversion, special types detection, and validation.
@@ -542,7 +494,8 @@ class DataFrame:
         elif isinstance(value, list):
             if len(value) != len(self) and len(self) > 0:
                 raise ValueError(
-                    f"Length of values ({len(value)}) does not match length of dataframe ({len(self)})"
+                    f"""Length of values ({len(value)}) does not match length of 
+                    dataframe ({len(self)})"""
                 )
 
             # Check for special types (strings or datetimes)
@@ -562,7 +515,7 @@ class DataFrame:
             ):
                 # Convert datetime objects to int64 nanoseconds
                 dt_index = pd.DatetimeIndex([x for x in value if x is not None])
-                int_values = np.array([x.astype(np.int64) for x in dt_index])
+                int_values = np.array([x.astype(np.int64) for x in dt_index])  # type: ignore
 
                 # Create array with NaT placeholders for None values
                 full_array = np.full(len(value), pd.NaT.value, dtype=np.int64)
@@ -580,28 +533,30 @@ class DataFrame:
         elif isinstance(value, (np.ndarray, jax.Array)):
             if len(value) != len(self) and len(self) > 0:
                 raise ValueError(
-                    f"Length of values ({len(value)}) does not match length of dataframe ({len(self)})"
+                    f"""Length of values ({len(value)}) does not match length of 
+                    dataframe ({len(self)})"""
                 )
             value_array = jnp.array(value, dtype=jnp.float64)
             metadata["dtype_flag"] = None
         else:
             raise TypeError(
-                f"Column value must be a numpy array, JAX array, list, or scalar. Got {type(value)}"
+                f"""Column value must be a numpy array, JAX array, list, or scalar. 
+                Got {type(value)}"""
             )
 
         return value_array
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Number of rows in the dataframe."""
         if self._values.size == 0:
             return 0
         return self._values.shape[0]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """String representation similar to pandas."""
         return self.__str__()
 
-    def __str__(self):
+    def __str__(self) -> str:  # noqa: PLR0912
         """Formatted string representation."""
         if len(self) == 0:
             return "Empty JaxDataFrame"
@@ -690,7 +645,7 @@ class DataFrame:
             + f"\n\n{dtypes_section}"
         )
 
-    def _format_value(self, column, idx):
+    def _format_value(self, column: str, idx: int) -> str:  # noqa: PLR0911
         """Format a single value for display."""
         if idx >= len(self):
             return "N/A"
@@ -707,10 +662,10 @@ class DataFrame:
                     return "NaT"
 
                 # Convert directly using pd.to_datetime
-                dt = pd.to_datetime(val, unit="ns")
+                dt = pd.to_datetime(val, unit="ns")  # type: ignore
                 return str(dt)
-            except:
-                return f"Invalid datetime ({val})"
+            except Exception as e:
+                return f"Invalid datetime ({val}) - {e}"
         elif metadata["dtype_flag"] == CATEGORY_TYPE_FLAG:
             # Convert category code to string
             try:
@@ -718,12 +673,12 @@ class DataFrame:
                 if int(val) == -1 or int(val) not in category_map:
                     return "None"
                 return category_map[int(val)]
-            except:
+            except Exception:
                 return str(val)
         else:
             return str(val)
 
-    def head(self, n=5):
+    def head(self, n: int = 5) -> "DataFrame":
         """
         Return the first n rows.
 
@@ -750,7 +705,7 @@ class DataFrame:
 
         return result
 
-    def tail(self, n=5):
+    def tail(self, n: int = 5) -> "DataFrame":
         """
         Return the last n rows.
 
@@ -777,12 +732,13 @@ class DataFrame:
 
         return result
 
-    def apply(self, func: Callable, axis=0):
+    def apply(self, func: Callable, axis: int = 0) -> "DataFrame":
         """
         Apply a function along an axis.
 
         Args:
-            func: JAX function to apply - function should take a JAX array and return a JAX array
+            func: JAX function to apply - function should take a JAX array and return
+                a JAX array
             axis: 0 for columns, 1 for rows
 
         Returns:
@@ -806,7 +762,8 @@ class DataFrame:
             result_names = self._column_names
         else:
             result_values = self._apply_rows_core(self._values, func)
-            # For row operations, create a compound name with function name and original columns
+            # For row operations, create a compound name with function name and
+            # original columns
             func_name = getattr(func, "__name__", "lambda")
             if isinstance(func, type(lambda: None)):
                 func_name = "lambda"
@@ -832,7 +789,9 @@ class DataFrame:
 
         return result
 
-    def _apply_columns_core(self, values, special_cols_mask, func):
+    def _apply_columns_core(
+        self, values: jax.Array, special_cols_mask: jax.Array, func: Callable
+    ) -> jax.Array:
         """Pure JAX function for column-wise apply (fully traceable)."""
 
         def process_column(col_idx, values):
@@ -849,9 +808,9 @@ class DataFrame:
         )
 
         # Stack columns properly
-        return jnp.transpose(result_columns)
+        return jnp.transpose(result_columns)  # type: ignore
 
-    def _apply_rows_core(self, values, func):
+    def _apply_rows_core(self, values: jax.Array, func: Callable) -> jax.Array:
         """Pure JAX function for row-wise apply (fully traceable)."""
         # Apply function to each row using vmap
         result_values = jax.vmap(func)(values)
@@ -866,7 +825,7 @@ class DataFrame:
         # Always reshape to column vector - no conditional needed
         return ensure_column_vector(result_values)
 
-    def rolling(self, window_size: int, min_periods: int = None):
+    def rolling(self, window_size: int, min_periods: Optional[int] = None) -> "Rolling":
         """
         Create a rolling window view of the dataframe.
 
@@ -880,7 +839,7 @@ class DataFrame:
         """
         return Rolling(self, window_size, min_periods)
 
-    def groupby(self, by):
+    def groupby(self, by: Union[str, Callable]) -> "GroupBy":
         """
         Group the dataframe by a column.
 
@@ -892,7 +851,7 @@ class DataFrame:
         """
         return GroupBy(self, by)
 
-    def to_pandas(self):
+    def to_pandas(self) -> pd.DataFrame:
         """
         Convert JaxDataFrame to pandas DataFrame.
 
@@ -928,17 +887,17 @@ class DataFrame:
         return pd.DataFrame(data)
 
     @classmethod
-    def from_numpy(cls, array, columns):
+    def from_numpy(cls, array: np.ndarray, columns: List[str]) -> "DataFrame":
         """Create a JaxDataFrame from a 2D numpy array."""
         return cls(array, columns=columns)
 
     @classmethod
-    def from_jax(cls, array, columns):
+    def from_jax(cls, array: jax.Array, columns: List[str]) -> "DataFrame":
         """Create a JaxDataFrame from a 2D JAX array."""
         return cls(array, columns=columns)
 
     @classmethod
-    def from_pandas(cls, df):
+    def from_pandas(cls, df: pd.DataFrame) -> "DataFrame":
         """Create a JaxDataFrame from a pandas DataFrame."""
         return cls(df)
 
@@ -946,14 +905,16 @@ class DataFrame:
 class Rolling:
     """Represents a rolling window over a JaxDataFrame."""
 
-    def __init__(self, df: DataFrame, window_size: int, min_periods: int = None):
+    def __init__(
+        self, df: DataFrame, window_size: int, min_periods: Optional[int] = None
+    ):
         """
         Initialize a rolling window for a dataframe.
 
         Args:
             df: The JaxDataFrame to create windows from
             window_size: Size of each window
-            min_periods: Minimum number of observations in window required to have a value.
+            min_periods: Minimum num of observations in window required to have a value.
                          If None, defaults to window_size.
         """
         self.df = df
@@ -961,9 +922,9 @@ class Rolling:
         # Set min_periods to window_size if None (pandas default behavior)
         self.min_periods = min_periods if min_periods is not None else window_size
 
-    def apply(self, func: Callable):
+    def apply(self, func: Callable) -> DataFrame:
         """
-        Apply a JAX function to each window of each column, following traceable architecture.
+        Apply a JAX function to each window of each column, in a traceable manner.
 
         Args:
             func: A JAX-compatible function to apply to each window
@@ -985,7 +946,7 @@ class Rolling:
         # Phase 3: Post-processing (non-traceable)
         return self._wrap_result(result_values)
 
-    def _prepare_column_mask(self):
+    def _prepare_column_mask(self) -> jax.Array:
         """Create boolean mask for processable columns (non-traceable)."""
         process_mask = []
         for col in self.df._column_names:
@@ -997,7 +958,13 @@ class Rolling:
             process_mask.append(should_process)
         return jnp.array(process_mask)
 
-    def _apply_core(self, values, process_mask, window_size, func):
+    def _apply_core(
+        self,
+        values: jax.Array,
+        process_mask: jax.Array,
+        window_size: int,
+        func: Callable,
+    ) -> jax.Array:
         """Pure JAX implementation of rolling window computation (fully traceable)."""
         n_rows, n_cols = values.shape
 
@@ -1040,7 +1007,11 @@ class Rolling:
 
                 # Process window using the appropriate masking strategy
                 return self._process_window(
-                    buffer, mask, func, col_data[row_idx], is_full_window
+                    buffer,
+                    mask,
+                    func,
+                    col_data[row_idx],  # type: ignore
+                    is_full_window,
                 )
 
             # Apply the window processor to all positions
@@ -1053,7 +1024,15 @@ class Rolling:
         result_columns = jax.vmap(process_column)(jnp.arange(n_cols))
         return jnp.transpose(result_columns)
 
-    def _fill_window_element(self, i, carry, start_pos, col_data, n_rows, current_pos):
+    def _fill_window_element(  # noqa: PLR0913
+        self,
+        i: int,
+        carry: tuple,
+        start_pos: int,
+        col_data: jax.Array,
+        n_rows: int,
+        current_pos: int,
+    ) -> tuple:
         """Pure function for filling single window element (traceable)."""
         buffer, mask = carry
         src_idx = start_pos + i
@@ -1068,7 +1047,14 @@ class Rolling:
         value = jnp.where(valid, col_data[src_idx], 0.0)
         return (buffer.at[i].set(value), mask.at[i].set(valid))
 
-    def _process_window(self, buffer, mask, func, original_value, is_full_window):
+    def _process_window(
+        self,
+        buffer: jax.Array,
+        mask: jax.Array,
+        func: Callable,
+        original_value: float,
+        is_full_window: bool,
+    ) -> float:
         """Pure function for window processing (traceable)."""
         valid_count = jnp.sum(mask)
 
@@ -1103,7 +1089,7 @@ class Rolling:
             None,
         )
 
-    def _wrap_result(self, result_values):
+    def _wrap_result(self, result_values: jax.Array) -> DataFrame:
         """Construct result DataFrame (non-traceable)."""
         result_df = DataFrame({})
         result_df._column_names = self.df._column_names.copy()
@@ -1116,7 +1102,9 @@ class Rolling:
 
         return result_df
 
-    def _apply_with_masking(self, fn, values, mask):
+    def _apply_with_masking(
+        self, fn: Callable, values: jax.Array, mask: jax.Array
+    ) -> float:
         """
         Apply function to masked values in a JAX-traceable way.
 
@@ -1138,7 +1126,7 @@ class Rolling:
         # First mask out invalid positions
         masked_values = jnp.where(mask, values, jnp.nan)
 
-        # Apply the function (which should handle NaNs properly if it's nanmean, nansum, etc.)
+        # Apply the function (which should handle NaNs properly like nanmean, nansum..)
         result = fn(masked_values)
 
         # If no valid values or all values are NaN, return NaN
@@ -1149,7 +1137,7 @@ class Rolling:
 class GroupBy:
     """Represents a groupby operation on a JaxDataFrame."""
 
-    def __init__(self, df: DataFrame, by):
+    def __init__(self, df: DataFrame, by: Union[str, Callable]):
         """
         Initialize a groupby object.
 
@@ -1190,7 +1178,7 @@ class GroupBy:
         # This helps make the apply function more traceable
         self.group_ids = self._create_group_id_mapping()
 
-    def _compute_groups(self):
+    def _compute_groups(self) -> tuple:
         """
         Compute unique groups and their indices (NON-TRACEABLE).
         Returns a tuple of (unique_groups, group_indices_dict)
@@ -1210,7 +1198,7 @@ class GroupBy:
 
         return jnp.array(unique_groups), group_indices
 
-    def _create_group_id_mapping(self):
+    def _create_group_id_mapping(self) -> jax.Array:
         """
         Create a mapping from row index to group ID (NON-TRACEABLE).
         This will help make apply operations more traceable.
@@ -1228,7 +1216,7 @@ class GroupBy:
 
         return jnp.array(group_ids)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: Union[str, List[str]]) -> "GroupBy":
         """
         Select columns from the grouped data (NON-TRACEABLE).
 
@@ -1238,7 +1226,8 @@ class GroupBy:
         Returns:
             JaxGroupBy with selected columns
         """
-        # NON-TRACEABLE: This method constructs new Python objects and uses dynamic data selection
+        # NON-TRACEABLE: This method constructs new Python objects and uses
+        # dynamic data selection
         if isinstance(key, str):
             # Create a copy of self with specified column
             if key not in self.df.columns:
@@ -1290,7 +1279,8 @@ class GroupBy:
             # Create a new dataframe with just the structure/metadata
             selected_df = DataFrame({})
 
-            # Determine which columns to include, ensuring groupby column is included and first
+            # Determine which columns to include, ensuring groupby column
+            # is included and first
             columns_to_include = key.copy()
             if (
                 isinstance(self.by, str)
@@ -1327,9 +1317,9 @@ class GroupBy:
         else:
             raise TypeError(f"Unsupported key type: {type(key)}")
 
-    def rolling(self, window_size: int):
+    def rolling(self, window_size: int) -> "GroupByRolling":
         """
-        Create a rolling window view of the grouped dataframe (NON-TRACEABLE initialization).
+        Create a rolling window view of the grouped dataframe (NON-TRACEABLE init).
 
         Args:
             window_size: Size of the rolling window
@@ -1340,14 +1330,14 @@ class GroupBy:
         # NON-TRACEABLE: This method constructs a new Python object
         return GroupByRolling(self, window_size)
 
-    def aggregate(self, func: Callable):
+    def aggregate(self, func: Callable) -> DataFrame:  # noqa: PLR0912
         """
         Apply an aggregation function to each group (fully traceable).
         This explicitly treats the function as an aggregation (e.g. mean, sum, max),
         which will return one row per group.
 
         Args:
-            func: A JAX-compatible reduction function that takes an array and returns a scalar
+            func: A pure JAX reduction function that takes an array and returns a scalar
 
         Returns:
             JaxDataFrame: One row per group with aggregated values
@@ -1401,7 +1391,7 @@ class GroupBy:
             # For special types, take the first value from each group
             if metadata["dtype_flag"] in [DATETIME_TYPE_FLAG, CATEGORY_TYPE_FLAG]:
                 col_results = []
-                for i, group in enumerate(self.unique_groups):
+                for _, group in enumerate(self.unique_groups):
                     group_float = float(group)
                     indices = self.group_indices.get(group_float, [])
                     if len(indices) > 0:
@@ -1428,15 +1418,16 @@ class GroupBy:
 
         return result_df
 
-    def transform(self, func: Callable):
+    def transform(self, func: Callable) -> DataFrame:
         """
         Apply a transformation function to each group (partly traceable).
-        This explicitly treats the function as a transformation that returns an array of the
-        same size as its input, resulting in a DataFrame of the same shape as the original.
+        This explicitly treats the function as a transformation that returns an array
+        of the same size as its input, resulting in a DataFrame of the same shape as
+        the original.
 
         Args:
-            func: A JAX-compatible transformation function that takes an array and returns an array
-                  of the same length
+            func: A JAX-compatible transformation function that takes an array and
+                    returns an array of the same length
 
         Returns:
             JaxDataFrame: Same shape as input with transformed values
@@ -1485,7 +1476,7 @@ class GroupBy:
             ]:
                 continue
 
-            # Process each group (non-traceable outer loop, but computed during initialization)
+            # Process each group (non-traceable outer loop, but computed during init)
             for group_val in self.unique_groups:
                 group_key = float(group_val)
                 indices = self.group_indices.get(group_key, [])
@@ -1514,7 +1505,9 @@ class GroupBy:
 
         return result_df
 
-    def _aggregate_core(self, core_data, func):
+    def _aggregate_core(
+        self, core_data: List[jax.Array], func: Callable
+    ) -> List[jax.Array]:
         """
         Pure JAX function for computing aggregations within groups.
 
@@ -1528,12 +1521,13 @@ class GroupBy:
         agg_results = []
         for data in core_data:
             # For regular columns, apply aggregation to each group directly
-            # This avoids the complex chain of jax.lax.cond operations in the previous implementation
+            # This avoids the complex chain of jax.lax.cond operations in the previous
+            # implementation
             col_data = data
 
             # Process each group (non-traceable loop, but known at initialization time)
             group_results = []
-            for i, group in enumerate(self.unique_groups):
+            for _, group in enumerate(self.unique_groups):
                 group_float = float(group)
                 indices = self.group_indices.get(group_float, [])
 
@@ -1551,7 +1545,9 @@ class GroupBy:
 
         return agg_results
 
-    def _transformation_core(self, core_data, func):
+    def _transformation_core(
+        self, core_data: List[jax.Array], func: Callable
+    ) -> List[jax.Array]:
         """
         Pure JAX function for computing transformations within groups.
 
@@ -1564,7 +1560,7 @@ class GroupBy:
         """
         transformed_values = []
         for col_data in core_data:
-            # Process each group (non-traceable outer loop, but computed during initialization)
+            # Process each group (non-traceable outer loop, but computed during init)
             group_results = []
             for group_val in self.unique_groups:
                 group_key = float(group_val)
@@ -1574,7 +1570,7 @@ class GroupBy:
                     group_results.append(jnp.array([]))
                     continue
 
-                # Extract data for this group (fixed size for this group, known at this point)
+                # Extract data for this group (fixed size for this group, known here)
                 group_data = col_data[indices]
 
                 # Apply transformation (fully traceable inner operation)
@@ -1586,7 +1582,7 @@ class GroupBy:
         return transformed_values
 
     # Helper methods for special column types
-    def to_datetime(self):
+    def to_datetime(self) -> pd.Series:
         """
         Convert the groupby column to pandas datetime if it's a datetime column.
         NON-TRACEABLE: Uses pandas conversion
@@ -1599,7 +1595,7 @@ class GroupBy:
         else:
             raise TypeError("Groupby column is not a datetime type")
 
-    def to_strings(self):
+    def to_strings(self) -> pd.Series:
         """
         Convert the groupby column to strings if it's a categorical column.
         NON-TRACEABLE: Uses pandas conversion
@@ -1609,6 +1605,7 @@ class GroupBy:
             and self.by_metadata["dtype_flag"] == CATEGORY_TYPE_FLAG
         ):
             cat_map = self.by_metadata["category_map"]
+            assert cat_map is not None
             return pd.Series(
                 [
                     cat_map.get(int(x), None) if x != -1 and not jnp.isnan(x) else None
@@ -1620,7 +1617,8 @@ class GroupBy:
 
 
 class GroupByRolling:
-    """Represents a rolling window operation on a grouped dataframe (Maximally traceable implementation)."""
+    """Represents a rolling window operation on a grouped dataframe (Maximally traceable
+    implementation)."""
 
     def __init__(self, groupby: GroupBy, window_size: int):
         """
@@ -1648,7 +1646,7 @@ class GroupByRolling:
         # Convert to JAX array for use in traceable computation
         self.process_mask_array = jnp.array(self.column_masks)
 
-    def apply(self, func: Callable):
+    def apply(self, func: Callable) -> DataFrame:
         """
         Apply a JAX function to rolling windows within each group.
 
@@ -1683,9 +1681,15 @@ class GroupByRolling:
 
         return result_df
 
-    def _compute_grouped_rolling_core(
-        self, values, group_ids, unique_groups, process_mask, window_size, func
-    ):
+    def _compute_grouped_rolling_core(  # noqa: PLR0913
+        self,
+        values: jax.Array,
+        group_ids: jax.Array,
+        unique_groups: jax.Array,
+        process_mask: jax.Array,
+        window_size: int,
+        func: Callable,
+    ) -> jax.Array:
         """
         Pure JAX function for computing rolling windows grouped by IDs. Fully traceable.
 
@@ -1781,17 +1785,19 @@ class GroupByRolling:
 
                 # Different NaN handling based on window size:
                 # For window_size=2, we need first element to be original value
-                # For window_size>=3, we return NaN for the first (window_size-1) elements
+                # For window_size>=3, we return NaN for the first (win_size-1) elements
                 # This makes handling work consistently for the test cases
                 window_is_incomplete = jnp.where(
-                    window_size == 2,
-                    # For window_size=2, only consider position 0 incomplete in groups with >1 element
+                    window_size == 2,  # noqa: PLR2004
+                    # For window_size=2, only consider position 0 incomplete in groups
+                    #  with >1 element
                     jnp.logical_and(relative_pos == 0, valid_count > 1),
                     # For window_size>=3, regular pandas-style handling
                     relative_pos < window_size - 1,
                 )
 
-                # Handle the case where group is invalid, window is incomplete, or no valid elements
+                # Handle the case where group is invalid, window is incomplete,
+                # or no valid elements
                 def apply_func(_, buffer=buffer, mask=mask):
                     # Apply the function to masked values
                     masked_values = jnp.where(mask, buffer, jnp.nan)
@@ -1803,8 +1809,10 @@ class GroupByRolling:
                     lambda _: jax.lax.cond(
                         window_is_incomplete,
                         lambda _: jnp.where(
-                            window_size == 2, col_data[row_idx], jnp.nan
-                        ),  # For window_size=2, first element is original, otherwise NaN
+                            window_size == 2,  # noqa: PLR2004
+                            col_data[row_idx],
+                            jnp.nan,
+                        ),  # For window_size=2 first element is original, otherwise NaN
                         apply_func,  # Apply function if we have a complete window
                         None,
                     ),
@@ -1827,9 +1835,9 @@ class GroupByRolling:
         result_columns = jax.vmap(process_column)(column_indices)
 
         # Transpose to get back to (rows, cols) shape
-        return jnp.transpose(result_columns)
+        return jnp.transpose(result_columns)  # type: ignore
 
-    def aggregate(self, func: Callable):
+    def aggregate(self, func: Callable) -> DataFrame:
         """
         Apply an aggregation function to each rolling window within each group.
 
@@ -1837,6 +1845,7 @@ class GroupByRolling:
             func: A JAX-compatible aggregation function for each window
 
         Returns:
-            JaxDataFrame: Same shape as input with each value replaced by its window aggregation
+            JaxDataFrame: Same shape as input with each value replaced by its window
+             aggregation
         """
         return self.apply(func)

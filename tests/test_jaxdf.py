@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from jandax.core import DataFrame, ns_to_pd_datetime, pd_datetime_to_ns
+from jandax.core import DataFrame
+from jandax.utils import ns_to_pd_datetime, pd_datetime_to_ns, to_datetime, to_strings
 
 
 # Basic initialization tests
@@ -45,8 +46,8 @@ def test_init_from_array():
     assert jdf.columns == ["A", "B"]
 
     # Test accessing data
-    np.testing.assert_array_equal(jdf["A"].values, np.array([1, 3, 5]))
-    np.testing.assert_array_equal(jdf["B"].values, np.array([2, 4, 6]))
+    np.testing.assert_array_equal(jdf["A"], np.array([1, 3, 5]))
+    np.testing.assert_array_equal(jdf["B"], np.array([2, 4, 6]))
 
 
 # Column access and manipulation tests
@@ -71,14 +72,12 @@ def test_column_assignment(jax_dataframe):
 
     assert "E" in jax_dataframe.columns
     np.testing.assert_array_equal(
-        jax_dataframe["E"].values, np.array([100, 200, 300, 400, 500])
+        jax_dataframe["E"], np.array([100, 200, 300, 400, 500])
     )
 
     # Replace existing column
     jax_dataframe["A"] = [10, 20, 30, 40, 50]
-    np.testing.assert_array_equal(
-        jax_dataframe["A"].values, np.array([10, 20, 30, 40, 50])
-    )
+    np.testing.assert_array_equal(jax_dataframe["A"], np.array([10, 20, 30, 40, 50]))
 
 
 # Datetime handling tests
@@ -86,7 +85,7 @@ def test_datetime_conversion(datetime_data):
     """Test datetime column handling."""
     # Check datetime conversion
     date_col = datetime_data["date"]
-    dt_values = date_col.to_datetime()
+    dt_values = to_datetime(date_col)
 
     assert isinstance(dt_values, pd.DatetimeIndex)
     assert len(dt_values) == 5
@@ -97,7 +96,8 @@ def test_datetime_conversion(datetime_data):
 def test_categorical_data(categorical_data):
     """Test categorical column handling."""
     cat_col = categorical_data["category"]
-    string_values = cat_col.to_strings()
+    category_map = categorical_data._column_metadata["category"]["category_map"]
+    string_values = to_strings(cat_col, category_map)
 
     assert isinstance(string_values, pd.Series)
     assert list(string_values) == ["red", "green", "blue", "red", "green"]
@@ -109,15 +109,13 @@ def test_apply_function(numeric_data):
     # Apply function to columns
     result = numeric_data.apply(lambda x: x * 2, axis=0)
 
-    np.testing.assert_array_equal(result["X"].values, np.array([2, 4, 6, 8, 10]))
-    np.testing.assert_array_equal(
-        result["Y"].values, np.array([1.0, 3.0, 5.0, 7.0, 9.0])
-    )
+    np.testing.assert_array_equal(result["X"], np.array([2, 4, 6, 8, 10]))
+    np.testing.assert_array_equal(result["Y"], np.array([1.0, 3.0, 5.0, 7.0, 9.0]))
 
     # Apply function to rows
     result = numeric_data.apply(lambda x: jnp.sum(x), axis=1)
     np.testing.assert_array_equal(
-        result["lambda_X_Y"].values, np.array([1.5, 3.5, 5.5, 7.5, 9.5])
+        result["lambda_X_Y"], np.array([1.5, 3.5, 5.5, 7.5, 9.5])
     )
 
 
@@ -169,7 +167,8 @@ def test_rolling_groupby():
         pd_symbol_values = pd_results[symbol]
 
         # Get JaxDataFrame values for this symbol
-        mask = jdf["symbol"].to_strings() == symbol
+        symbol_category_map = jdf._column_metadata["symbol"]["category_map"]
+        mask = to_strings(jdf["symbol"], symbol_category_map) == symbol
         jax_symbol_indices = np.where(mask)[0]
         jax_symbol_values = jax_result["price"][jax_symbol_indices]
 
@@ -272,7 +271,8 @@ def test_groupby_rolling_sum_oversize_window():
 
         # Get JaxDataFrame values for this symbol
         # Convert pandas Series boolean mask to numpy array before indexing
-        mask = np.array(jdf["symbol"].to_strings() == symbol)
+        symbol_category_map = jdf._column_metadata["symbol"]["category_map"]
+        mask = np.array(to_strings(jdf["symbol"], symbol_category_map) == symbol)
         jax_symbol_values = jax_result["price"][mask]
         jax_symbol_values = jax_symbol_values[~np.isnan(jax_symbol_values)]
 
@@ -373,10 +373,10 @@ def test_groupby_mean_vs_pandas():
 
     # Verify values match pandas result
     pd_result_dict = pd_result.to_dict()
-    for i, group_val in enumerate(jax_result["colA"].values):
+    for i, group_val in enumerate(jax_result["colA"]):
         group_key = float(group_val)
         expected_mean = pd_result_dict[group_key]
-        actual_mean = float(jax_result["colB"].values[i])
+        actual_mean = float(jax_result["colB"][i])
         assert np.isclose(actual_mean, expected_mean), (
             f"Group {group_key}: expected mean {expected_mean}, got {actual_mean}"
         )
@@ -403,10 +403,10 @@ def test_groupby_mean_aggregate_vs_pandas():
 
     # Verify values match pandas result
     pd_result_dict = pd_result.to_dict()
-    for i, group_val in enumerate(jax_result["colA"].values):
+    for i, group_val in enumerate(jax_result["colA"]):
         group_key = float(group_val)
         expected_mean = pd_result_dict[group_key]
-        actual_mean = float(jax_result["colB"].values[i])
+        actual_mean = float(jax_result["colB"][i])
         assert np.isclose(actual_mean, expected_mean), (
             f"Group {group_key}: expected mean {expected_mean}, got {actual_mean}"
         )
@@ -437,7 +437,7 @@ def test_groupby_transform_vs_pandas():
 
     # Verify values
     pd_values = pd_result.values
-    jax_values = jax_result["colB"].values
+    jax_values = jax_result["colB"]
     np.testing.assert_allclose(
         jax_values,
         pd_values,
@@ -472,7 +472,7 @@ def test_groupby_transform_explicit_vs_pandas():
 
     # Verify values
     pd_values = pd_result.values
-    jax_values = jax_result["colB"].values
+    jax_values = jax_result["colB"]
     np.testing.assert_allclose(
         jax_values,
         pd_values,
@@ -514,9 +514,10 @@ def test_categorical_groupby_vs_pandas():
 
     # Verify values
     pd_means = pd_result.set_index("stock")["price"].to_dict()
-    for i, stock in enumerate(jax_result["stock"].to_strings()):
+    stock_category_map = jax_result._column_metadata["stock"]["category_map"]
+    for i, stock in enumerate(to_strings(jax_result["stock"], stock_category_map)):
         expected = pd_means[stock]
-        actual = float(jax_result["price"].values[i])
+        actual = float(jax_result["price"][i])
         assert np.isclose(actual, expected)
 
 
@@ -556,7 +557,7 @@ def test_rankdata_with_multiindex():
     # Verify values for each column
     for col in ["price", "volume"]:
         pd_col_ranks = pd_ranked[col].values
-        jax_col_ranks = jax_ranked[col].values
+        jax_col_ranks = jax_ranked[col]
 
         np.testing.assert_allclose(
             pd_col_ranks,
@@ -605,7 +606,7 @@ def test_rankdata_transform_with_multiindex():
     # Verify values for each column
     for col in ["price", "volume"]:
         pd_col_ranks = pd_ranked[col].values
-        jax_col_ranks = jax_ranked[col].values
+        jax_col_ranks = jax_ranked[col]
 
         np.testing.assert_allclose(
             pd_col_ranks,
@@ -679,7 +680,8 @@ def test_rolling_groupby_aggregate():
         pd_symbol_values = pd_results[symbol]
 
         # Get JaxDataFrame values for this symbol
-        mask = jdf["symbol"].to_strings() == symbol
+        symbol_category_map = jdf._column_metadata["symbol"]["category_map"]
+        mask = to_strings(jdf["symbol"], symbol_category_map) == symbol
         jax_symbol_indices = np.where(mask)[0]
         jax_symbol_values = jax_result["price"][jax_symbol_indices]
 
@@ -718,12 +720,14 @@ def test_groupby_rolling_display():
 
     # Check that symbols are properly preserved (not numeric codes)
     pd_result = result.to_pandas()
+    # When converted to pandas, categorical columns are already converted to pandas Categorical type
+    # so we can directly check the category values
     assert set(pd_result["symbol"]) == {"AAPL", "GOOGL"}, (
         "Symbol values should be strings, not codes"
     )
 
     # Check values are correct
-    # For AAPL rows (0, 2, 4, 6)
+    # For AAPL rows
     aapl_prices = pd_result.loc[pd_result["symbol"] == "AAPL", "price"].values
 
     # First element should be NaN for window_size=2 in grouped rolling
@@ -736,7 +740,7 @@ def test_groupby_rolling_display():
     # Separately test that first value is NaN
     assert np.isnan(aapl_prices[0]), "First value should be NaN for window_size=2"
 
-    # For GOOGL rows (1, 3, 5, 7)
+    # For GOOGL rows
     googl_prices = pd_result.loc[pd_result["symbol"] == "GOOGL", "price"].values
 
     # Same test structure for GOOGL prices
@@ -775,7 +779,7 @@ def test_rolling_with_min_periods_parameter():
         for col in ["A", "B"]:
             # Convert to numpy arrays for consistent comparison
             pd_values = pd_result[col].values
-            jax_values = jax_result[col].values
+            jax_values = jax_result[col]
 
             # Check that NaN patterns match (NaN in same positions)
             pd_isnan = np.isnan(pd_values)
@@ -826,7 +830,15 @@ def test_empty_groups_in_groupby():
     for group in ["A", "B", "C"]:
         pd_value = pd_result.loc[group]
         # Convert pandas Series to numpy array before using jnp.where
-        jax_idx = jnp.where(np.array(jax_result["group"].to_strings() == group))[0][0]
+        jax_idx = jnp.where(
+            np.array(
+                to_strings(
+                    jax_result["group"],
+                    jax_result._column_metadata["group"]["category_map"],
+                )
+                == group
+            )
+        )[0][0]
         jax_value = jax_result["value"][jax_idx]
         assert np.isclose(jax_value, pd_value), (
             f"Group {group} doesn't match pandas value"
@@ -854,7 +866,15 @@ def test_nan_handling_in_groupby():
     for group in ["A", "B", "C"]:
         pd_value = pd_result.loc[group]
         # Convert pandas Series to numpy array before using jnp.where
-        jax_idx = jnp.where(np.array(jax_result["group"].to_strings() == group))[0][0]
+        jax_idx = jnp.where(
+            np.array(
+                to_strings(
+                    jax_result["group"],
+                    jax_result._column_metadata["group"]["category_map"],
+                )
+                == group
+            )
+        )[0][0]
         jax_value = jax_result["value"][jax_idx]
 
         # Handle case where pandas returns NaN (all values in group are NaN)
@@ -881,12 +901,28 @@ def test_all_nan_group():
 
     # Group A should be NaN
     # Convert pandas Series to numpy array before using jnp.where
-    jax_a_idx = jnp.where(np.array(jax_result["group"].to_strings() == "A"))[0][0]
+    jax_a_idx = jnp.where(
+        np.array(
+            to_strings(
+                jax_result["group"],
+                jax_result._column_metadata["group"]["category_map"],
+            )
+            == "A"
+        )
+    )[0][0]
     assert np.isnan(jax_result["value"][jax_a_idx]), "Group A should be NaN"
 
     # Group B should have a valid mean
     # Convert pandas Series to numpy array before using jnp.where
-    jax_b_idx = jnp.where(np.array(jax_result["group"].to_strings() == "B"))[0][0]
+    jax_b_idx = jnp.where(
+        np.array(
+            to_strings(
+                jax_result["group"],
+                jax_result._column_metadata["group"]["category_map"],
+            )
+            == "B"
+        )
+    )[0][0]
     assert np.isclose(jax_result["value"][jax_b_idx], 3.5), (
         "Group B should have mean 3.5"
     )
@@ -967,7 +1003,11 @@ def test_single_value_groups():
     jax_result = jdf.groupby("group").aggregate(jnp.std)
 
     # All groups should have std = 0 (or NaN depending on implementation)
-    for i, group in enumerate(jax_result["group"].to_strings()):
+    for i, group in enumerate(
+        to_strings(
+            jax_result["group"], jax_result._column_metadata["group"]["category_map"]
+        )
+    ):
         # Handle case where one implementation uses NaN and the other uses 0
         value = jax_result["value"][i]
         if np.isnan(value):
@@ -993,7 +1033,12 @@ def test_identical_values_in_groupby_column():
 
     # Check that we have one group
     assert jax_result.shape[0] == 1, "Should have exactly one group"
-    assert jax_result["group"].to_strings()[0] == "A", "Group name should be 'A'"
+    assert (
+        to_strings(
+            jax_result["group"], jax_result._column_metadata["group"]["category_map"]
+        )[0]
+        == "A"
+    ), "Group name should be 'A'"
 
     # Check the mean
     expected_mean = 3.0  # (1+2+3+4+5)/5
@@ -1071,7 +1116,7 @@ def test_datetime_diff_operation():
     pd_time_deltas = pdf["date"].diff().dt.total_seconds()
 
     # With JaxDataFrame, we need to convert to nanoseconds first, then compute diff
-    date_ns = jdf["date"].values
+    date_ns = jdf["date"]
     jax_diff_ns = np.diff(
         date_ns, prepend=date_ns[0]
     )  # Prepend first value to match pandas behavior
@@ -1117,7 +1162,9 @@ def test_groupby_transform_with_all_nan():
 
     # Get group A indices for JaxDF
     # Convert pandas Series boolean mask to numpy array before indexing
-    mask_jax_a = np.array(jdf["group"].to_strings() == "A")
+    mask_jax_a = np.array(
+        to_strings(jdf["group"], jdf._column_metadata["group"]["category_map"]) == "A"
+    )
     jax_values_a = jax_result["value"][mask_jax_a]
     assert np.isnan(jax_values_a).all(), "Group A should be all NaN in JaxDF result"
 
@@ -1127,7 +1174,9 @@ def test_groupby_transform_with_all_nan():
 
     # Get group B indices for JaxDF
     # Convert pandas Series boolean mask to numpy array before indexing
-    mask_jax_b = np.array(jdf["group"].to_strings() == "B")
+    mask_jax_b = np.array(
+        to_strings(jdf["group"], jdf._column_metadata["group"]["category_map"]) == "B"
+    )
     jax_values_b = jax_result["value"][mask_jax_b]
 
     # Check that non-NaN values match
