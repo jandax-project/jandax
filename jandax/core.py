@@ -1183,19 +1183,20 @@ class GroupBy:
         Compute unique groups and their indices (NON-TRACEABLE).
         Returns a tuple of (unique_groups, group_indices_dict)
         """
-        # Convert to numpy for more reliable unique value detection
-        grouping_np = np.array(self.grouping_values)
-        unique_groups = np.unique(grouping_np)
+        from jax.experimental import io_callback
 
-        # Create a mapping from group values to indices
+        result_shape = jax.ShapeDtypeStruct(
+            self.grouping_values.shape, self.grouping_values.dtype
+        )
+        grouping_concrete = io_callback(lambda x: x, result_shape, self.grouping_values)
+        grouping_np = np.array(jax.device_get(grouping_concrete))
+        unique_groups = np.unique(grouping_np)
         group_indices = {}
         for group in unique_groups:
-            # Find indices for this group
             mask = grouping_np == group
             indices = np.where(mask)[0]
-            if len(indices) > 0:  # Only store non-empty groups
+            if len(indices) > 0:
                 group_indices[float(group)] = indices
-
         return jnp.array(unique_groups), group_indices
 
     def _create_group_id_mapping(self) -> jax.Array:

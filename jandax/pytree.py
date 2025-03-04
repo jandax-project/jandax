@@ -18,6 +18,7 @@ def _dataframe_tree_flatten(df: DataFrame) -> Tuple[List[jax.Array], Dict[str, A
         "column_names": df._column_names,
         "column_mapping": df._column_mapping,
         "column_metadata": df._column_metadata,
+        "column_unique": df._column_unique if hasattr(df, "_column_unique") else {},
     }
 
     return leaves, aux_data
@@ -37,6 +38,9 @@ def _dataframe_tree_unflatten(
     self._column_names = aux_data["column_names"]
     self._column_mapping = aux_data["column_mapping"]
     self._column_metadata = aux_data["column_metadata"]
+
+    # Initialize _column_unique as empty dict to avoid jnp.unique in JIT context
+    self._column_unique = {}
 
     return self
 
@@ -79,6 +83,7 @@ def _groupby_tree_flatten(gb: GroupBy) -> Tuple[List[jax.Array], Dict[str, Any]]
         gb.grouping_values,
         gb.unique_groups,
         gb.group_ids,
+        gb.group_masks,
     ]
 
     # Auxiliary data contains metadata and the reference to DataFrame
@@ -103,6 +108,7 @@ def _groupby_tree_unflatten(
     self.grouping_values = leaves[0]
     self.unique_groups = leaves[1]
     self.group_ids = leaves[2]
+    self.group_masks = leaves[3]
 
     # Restore metadata from auxiliary data
     self.df = aux_data["df"]
