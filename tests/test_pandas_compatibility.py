@@ -12,11 +12,13 @@ from jandax.utils import to_datetime, to_strings
 def simple_df():
     """Create a simple DataFrame for testing."""
     return DataFrame(
-        {
-            "A": [1, 2, 3, 4, 5],
-            "B": [10.0, 20.0, 30.0, 40.0, 50.0],
-            "C": ["a", "b", "c", "d", "e"],
-        }
+        pd.DataFrame(
+            {
+                "A": [1, 2, 3, 4, 5],
+                "B": [10.0, 20.0, 30.0, 40.0, 50.0],
+                "C": ["a", "b", "c", "d", "e"],
+            }
+        )
     )
 
 
@@ -24,11 +26,13 @@ def simple_df():
 def numeric_df():
     """Create a numeric DataFrame for testing."""
     return DataFrame(
-        {
-            "A": [1, 2, 3, 4, 5],
-            "B": [10.0, 20.0, 30.0, 40.0, 50.0],
-            "C": [100, 200, 300, 400, 500],
-        }
+        pd.DataFrame(
+            {
+                "A": [1, 2, 3, 4, 5],
+                "B": [10.0, 20.0, 30.0, 40.0, 50.0],
+                "C": [100, 200, 300, 400, 500],
+            }
+        )
     )
 
 
@@ -36,10 +40,12 @@ def numeric_df():
 def missing_df():
     """Create a DataFrame with missing values for testing."""
     return DataFrame(
-        {
-            "A": [1, np.nan, 3, np.nan, 5],
-            "B": [10.0, 20.0, np.nan, 40.0, 50.0],
-        }
+        pd.DataFrame(
+            {
+                "A": [1, np.nan, 3, np.nan, 5],
+                "B": [10.0, 20.0, np.nan, 40.0, 50.0],
+            }
+        )
     )
 
 
@@ -47,7 +53,9 @@ def missing_df():
 def date_df():
     """Create a DataFrame with date values for testing."""
     return DataFrame(
-        {"date": pd.date_range("2023-01-01", periods=5), "value": [1, 2, 3, 4, 5]}
+        pd.DataFrame(
+            {"date": pd.date_range("2023-01-01", periods=5), "value": [1, 2, 3, 4, 5]}
+        )
     )
 
 

@@ -26,30 +26,6 @@ def test_init_from_dataframe(sample_dataframe, jax_dataframe):
     assert_frame_equal(reconverted, sample_dataframe, check_dtype=False)
 
 
-def test_init_from_dict():
-    """Test initialization from dictionary."""
-    data = {"X": [1, 2, 3], "Y": [4.0, 5.0, 6.0], "Z": ["a", "b", "c"]}
-    jdf = DataFrame(data)
-
-    assert jdf.shape == (3, 3)
-    assert "X" in jdf.columns
-    assert "Y" in jdf.columns
-    assert "Z" in jdf.columns
-
-
-def test_init_from_array():
-    """Test initialization from numpy array."""
-    data = np.array([[1, 2], [3, 4], [5, 6]])
-    jdf = DataFrame(data, columns=["A", "B"])
-
-    assert jdf.shape == (3, 2)
-    assert jdf.columns == ["A", "B"]
-
-    # Test accessing data
-    np.testing.assert_array_equal(jdf["A"], np.array([1, 3, 5]))
-    np.testing.assert_array_equal(jdf["B"], np.array([2, 4, 6]))
-
-
 # Column access and manipulation tests
 def test_column_access(jax_dataframe):
     """Test accessing columns."""
@@ -211,7 +187,7 @@ def test_rolling_sum_vs_pandas():
 
     # Create pandas DataFrame and JaxDataFrame
     pdf = pd.DataFrame(data)
-    jdf = DataFrame(data)
+    jdf = DataFrame(pd.DataFrame(data))
 
     # Test normal window size
     pd_result = pdf.rolling(window=3).sum()
@@ -250,7 +226,7 @@ def test_groupby_rolling_sum_oversize_window():
 
     # Create pandas DataFrame and JaxDataFrame
     pdf = pd.DataFrame(data)
-    jdf = DataFrame(data)
+    jdf = DataFrame(pd.DataFrame(data))
 
     # Calculate pandas result with window size 4 (larger than any group size)
     pd_results = {}

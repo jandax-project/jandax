@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 import pytest
 
 from jandax.core import DataFrame
@@ -8,7 +9,7 @@ from jandax.core import DataFrame
 @pytest.fixture
 def arithmetic_df():
     """Create a DataFrame with numeric data for arithmetic testing."""
-    return DataFrame(
+    pandas_df = pd.DataFrame(
         {
             "A": [1, 2, 3, 4, 5],
             "B": [10, 20, 30, 40, 50],
@@ -16,29 +17,32 @@ def arithmetic_df():
             "D": [0, 0.5, 1.0, 1.5, 2.0],
         }
     )
+    return DataFrame(pandas_df)
 
 
 @pytest.fixture
 def mixed_df():
     """Create a DataFrame with mixed data types."""
-    return DataFrame(
+    pandas_df = pd.DataFrame(
         {
             "numeric": [1, 2, 3, 4, 5],
             "float": [1.1, 2.2, 3.3, 4.4, 5.5],
             "string": ["a", "b", "c", "d", "e"],
         }
     )
+    return DataFrame(pandas_df)
 
 
 @pytest.fixture
 def nan_df():
     """Create a DataFrame with NaN values."""
-    return DataFrame(
+    pandas_df = pd.DataFrame(
         {
             "A": [1, np.nan, 3, np.nan, 5],
             "B": [10, 20, np.nan, 40, 50],
         }
     )
+    return DataFrame(pandas_df)
 
 
 # Column-Column arithmetic tests

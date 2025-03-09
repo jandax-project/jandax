@@ -1,569 +1,626 @@
-import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-
-from jandax.utils import ns_to_pd_datetime
-
-jax.config.update("jax_enable_x64", True)
+from jax.tree_util import register_pytree_node
 
 # Constants for special data types
 DATETIME_TYPE_FLAG = "datetime"
 CATEGORY_TYPE_FLAG = "category"
-NS_PER_DAY = 24 * 60 * 60 * 1_000_000_000  # nanoseconds in a day
 
 
 class DataFrame:
-    """A DataFrame-like container backed by a single JAX 2D array."""
+    """
+    DataFrame implementation that uses a full Cartesian product of indices for efficient
+    and fully traceable operations in JAX.
+
+    This implementation allows specifying any columns as index columns, and automatically
+    handles a Cartesian product of all combinations of these indices.
+    """
 
     def __init__(
         self,
-        data: Union[pd.DataFrame, np.ndarray, jax.Array, Dict[str, Any]],
-        columns: Optional[List[str]] = None,
-        include_index: bool = True,
+        df: Union[pd.DataFrame, Dict],
+        index_columns: Optional[List[str]] = None,
+        fill_value: float = np.nan,
     ):
         """
-        Initialize a JaxDataFrame from various data sources.
+        Initialize CartesianDataFrame from a pandas DataFrame.
 
         Args:
-            data: Data to initialize with (pandas DataFrame, numpy 2D array,
-                        JAX 2D array, dict of arrays)
-            columns: Optional column names (required for raw 2D arrays)
-                        include_index: If True and data is a pandas DataFrame, include
-                        the index as column(s)
+            df: Pandas DataFrame
+            index_columns: Columns to use as indices (if None, use DataFrame index)
+            fill_value: Value to use for missing combinations in the Cartesian product
         """
-        # NON-TRACEABLE SECTION: Initialization of metadata and storage
-        # These operations involve Python-level data structure creation
-        # and are not traceable.
-        self._column_metadata = {}
+        # Initialize storage
+        self._values = None  # JAX array of values
+        self._column_names = []  # Column names
+        self._column_mapping = {}  # Maps column name to index
+        self._column_dtypes = {}  # Original pandas dtypes
+        self._column_metadata = {}  # Column metadata
 
-        # Initialize storage for our data
-        self._values = jnp.zeros((0, 0))
-        self._column_names = []
-        self._column_mapping = {}  # Maps column name to column index
+        # Index information
+        self._index_columns = []  # Names of index columns
+        self._index_values = {}  # Maps index column to unique values
+        self._index_mappings = {}  # Maps index values to integer indices
+        self._index_sizes = {}  # Number of unique values for each index
 
-        # Handle pandas DataFrame
-        if isinstance(data, pd.DataFrame):
-            # NON-TRACEABLE SECTION: Pandas DataFrame handling
-            # This branch involves pandas-specific operations and is not traceable.
-            self._init_from_pandas(data, include_index)
+        if isinstance(df, dict):
+            # Convert dict to DataFrame
+            df = pd.DataFrame.from_dict(df)
+        # Process the input DataFrame
+        self._process_dataframe(df, index_columns, fill_value)
 
-        # Handle 2D numpy arrays or JAX arrays
-        elif isinstance(data, (np.ndarray, jax.Array)) and data.ndim == 2:  # noqa: PLR2004
-            # NON-TRACEABLE SECTION: Array handling
-            # This branch involves array-specific operations and is not traceable.
-            assert columns is not None
-            self._init_from_array(data, columns)
+    def _process_dataframe(
+        self, df: pd.DataFrame, index_columns: Optional[List[str]], fill_value: float
+    ):
+        """Process the input DataFrame and create the Cartesian grid."""
+        # Step 1: Handle the index columns determination
+        original_df = df.copy()
+        has_multi_index = isinstance(original_df.index, pd.MultiIndex)
 
-        # Handle another JaxDataFrame (copy)
-        elif isinstance(data, DataFrame):
-            # NON-TRACEABLE SECTION: JaxDataFrame copy
-            # This branch involves copying data structures and is not traceable.
-            self._init_from_jaxdf(data)
+        # Handle index_columns specification
+        if index_columns is None:
+            if has_multi_index:
+                # For MultiIndex, use all level names
+                index_columns = list(original_df.index.names)
+            elif original_df.index.name:
+                # For named index, use it
+                index_columns = [original_df.index.name]
+            else:
+                # For unnamed RangeIndex, don't use any index columns
+                # This fixes the issue with test_arithmetic.py
+                index_columns = []
 
-        # Handle dictionary of arrays
-        elif isinstance(data, dict):
-            # NON-TRACEABLE SECTION: Dictionary handling
-            # This branch involves dictionary-specific operations and is not traceable.
-            self._init_from_dict(data)
+        # Store index column names
+        self._index_columns = index_columns
 
-        else:
-            raise TypeError(
-                f"""JaxDataFrame can only be initialized from pandas DataFrame,
-                    2D arrays,another JaxDataFrame, or a dict of arrays. 
-                    Got {type(data)}"""
+        # If we have no index columns, create a simple default index
+        # This ensures we always have at least one index for the Cartesian grid
+        if not index_columns:
+            # Create a dummy index that just enumerates rows
+            default_index_name = "_row"
+            self._index_columns = [default_index_name]
+            self._index_values = {default_index_name: list(range(len(original_df)))}
+            self._index_mappings = {
+                default_index_name: {i: i for i in range(len(original_df))}
+            }
+            self._index_sizes = {default_index_name: len(original_df)}
+            self._column_metadata[default_index_name] = {"dtype_flag": None}
+
+            # Then process only data columns
+            working_df = original_df.copy()
+            data_columns = list(working_df.columns)
+
+            # Create a simple Cartesian index with just row numbers
+            idx_product = pd.Index(
+                self._index_values[default_index_name], name=default_index_name
             )
 
-        # Verify initialization succeeded
-        if not isinstance(self._values, jax.Array):
-            raise ValueError("Failed to initialize DataFrame values properly")
+        else:
+            # Step 2: Make sure the index columns are available as regular columns
+            working_df = original_df.copy()
+            if has_multi_index and any(
+                col not in working_df.columns for col in index_columns
+            ):
+                # Reset the index to get index levels as columns
+                working_df = working_df.reset_index()
+            elif not has_multi_index and index_columns[0] not in working_df.columns:
+                # Reset the index to get the index as a column
+                working_df = working_df.reset_index()
 
-    def _init_from_pandas(self, df: pd.DataFrame, include_index: bool):
-        """Initialize from pandas DataFrame."""
-        # NON-TRACEABLE SECTION: Pandas-specific operations
-        # These operations involve pandas data structures and are not traceable.
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
+            # Step 3: Process each index column to extract unique values
+            for col in index_columns:
+                # Get unique values
+                unique_values = working_df[col].unique()
 
-        # Process index if specified
-        if include_index:
-            if isinstance(df_copy.index, pd.MultiIndex):
-                # Handle MultiIndex by adding each level as a separate column
-                for i, idx_name in enumerate(df_copy.index.names):
-                    if idx_name is None:
-                        # Unnamed level gets generic name
-                        col_name = f"index_{i}"
-                        df_copy[col_name] = df_copy.index.get_level_values(i)
-                    else:
-                        df_copy[idx_name] = df_copy.index.get_level_values(idx_name)
+                # Store the column dtype for later use
+                column_dtype = working_df[col].dtype
+
+                # Store metadata and mappings based on data type
+                if pd.api.types.is_categorical_dtype(
+                    column_dtype
+                ) or pd.api.types.is_string_dtype(column_dtype):
+                    # For categorical or string, create a category mapping
+                    categories = (
+                        pd.Series(unique_values).astype("category").cat.categories
+                    )
+                    self._column_metadata[col] = {
+                        "dtype_flag": CATEGORY_TYPE_FLAG,
+                        "category_map": {i: cat for i, cat in enumerate(categories)},
+                    }
+                    # Store original values first
+                    self._index_values[col] = list(categories)
+                    self._index_mappings[col] = {
+                        val: i for i, val in enumerate(categories)
+                    }
+
+                elif pd.api.types.is_datetime64_any_dtype(column_dtype):
+                    # For datetime, keep original values for reindexing but store nanosecond representation
+                    self._column_metadata[col] = {"dtype_flag": DATETIME_TYPE_FLAG}
+                    # Store original datetime values
+                    self._index_values[col] = pd.DatetimeIndex(
+                        sorted(unique_values)
+                    ).to_pydatetime()
+                    # Create mapping from datetime to position
+                    self._index_mappings[col] = {
+                        val: i for i, val in enumerate(sorted(unique_values))
+                    }
+
+                else:
+                    # For regular numeric columns
+                    self._column_metadata[col] = {"dtype_flag": None}
+                    # Store sorted values
+                    self._index_values[col] = sorted(unique_values)
+                    self._index_mappings[col] = {
+                        val: i for i, val in enumerate(sorted(unique_values))
+                    }
+
+                # Store the number of unique values
+                self._index_sizes[col] = len(unique_values)
+
+            # Step 4: Create a MultiIndex with the Cartesian product of all index column values
+            if len(index_columns) > 1:
+                # Create a product of all index levels
+                idx_product = pd.MultiIndex.from_product(
+                    [self._index_values[col] for col in index_columns],
+                    names=index_columns,
+                )
             else:
-                # Handle regular Index - only add if it has a name
-                idx_name = df_copy.index.name
-                if idx_name is not None:
-                    df_copy[idx_name] = df_copy.index
-                # If index has no name, don't include it as a column
+                # For single index
+                idx_product = pd.Index(
+                    self._index_values[index_columns[0]], name=index_columns[0]
+                )
 
-        # Set up column names and mapping
-        self._column_names = list(df_copy.columns)
-        self._column_mapping = {
-            name: idx for idx, name in enumerate(self._column_names)
-        }
+            # Step 5: Create data columns (non-index columns)
+            data_columns = [
+                col for col in working_df.columns if col not in index_columns
+            ]
 
-        # Create a list to hold column arrays before stacking
-        column_arrays = []
+        # Step 6: Reindex the DataFrame with the Cartesian product
+        # Set up DataFrame with proper index
+        if index_columns:
+            if has_multi_index or len(index_columns) > 1:
+                # Reindex with MultiIndex
+                indexed_df = working_df.set_index(index_columns)
+            else:
+                # Reindex with simple Index
+                indexed_df = working_df.set_index(index_columns[0])
 
-        # Process columns
-        for col_name in self._column_names:
-            series = df_copy[col_name]
+            # Reindex to ensure all combinations exist
+            cart_df = indexed_df[data_columns].reindex(idx_product)
+        else:
+            # No index columns to reindex on, keep the original data
+            cart_df = working_df[data_columns]
 
-            # Handle datetime columns
-            if pd.api.types.is_datetime64_any_dtype(series.dtype):
-                # Convert to int64 nanoseconds
-                values = np.array([x.astype(np.int64) for x in series.values])
-                column_arrays.append(values)
-                self._column_metadata[col_name] = {
-                    "dtype_flag": DATETIME_TYPE_FLAG,
-                }
+        # Fill missing values
+        cart_df = cart_df.fillna(fill_value)
 
-            # Handle categorical/string columns
-            elif pd.api.types.is_string_dtype(series.dtype) or isinstance(
-                series.dtype, pd.CategoricalDtype
+        # Step 7: Store data columns information
+        self._column_names = data_columns
+        self._column_mapping = {name: i for i, name in enumerate(data_columns)}
+
+        # Step 8: Process data columns
+        data_arrays = []
+        for col in data_columns:
+            dtype = cart_df[col].dtype
+            self._column_dtypes[col] = dtype
+
+            # Handle special types
+            if pd.api.types.is_categorical_dtype(dtype) or pd.api.types.is_string_dtype(
+                dtype
             ):
                 # Convert to categorical integers
-                categories = series.astype("category").cat.categories.tolist()
-                codes = series.astype("category").cat.codes.values
-                column_arrays.append(codes)
-                self._column_metadata[col_name] = {
+                categories = cart_df[col].astype("category").cat.categories
+                codes = cart_df[col].astype("category").cat.codes.values
+                data_arrays.append(codes)
+                self._column_metadata[col] = {
                     "dtype_flag": CATEGORY_TYPE_FLAG,
-                    "category_map": {i: val for i, val in enumerate(categories)},
+                    "category_map": {i: cat for i, cat in enumerate(categories)},
                 }
 
-            # Handle regular numeric columns
+            elif pd.api.types.is_datetime64_any_dtype(dtype):
+                # Convert to nanoseconds since epoch
+                values = pd.DatetimeIndex(cart_df[col]).astype(np.int64).values
+                data_arrays.append(values)
+                self._column_metadata[col] = {"dtype_flag": DATETIME_TYPE_FLAG}
+
             else:
-                column_arrays.append(series.values)
-                self._column_metadata[col_name] = {"dtype_flag": None}
+                # Regular numeric column
+                data_arrays.append(cart_df[col].values)
+                self._column_metadata[col] = {"dtype_flag": None}
 
-        # Stack all columns into a single 2D array
-        # Note: we stack columns horizontally (axis=1) to create a 2D array with shape
-        # (n_rows, n_cols)
-        self._values = jnp.column_stack(column_arrays)
-
-    def _init_from_array(self, array: Union[np.ndarray, jax.Array], columns: List[str]):
-        """Initialize from a 2D numpy or JAX array."""
-        # NON-TRACEABLE SECTION: Array initialization
-        # These operations involve array-specific operations and are not traceable.
-        if columns is None:
-            raise ValueError(
-                "Column names must be provided when initializing from 2D arrays"
+        # Step 9: Convert to JAX array
+        if data_arrays:
+            self._values = jnp.column_stack(
+                [jnp.array(arr, dtype=jnp.float32) for arr in data_arrays]
             )
-
-        # Convert to JAX array if needed
-        if not isinstance(array, jax.Array):
-            self._values = jnp.array(array, dtype=jnp.float64)
         else:
-            self._values = array
+            # Handle empty DataFrame case
+            self._values = jnp.zeros((len(cart_df), 0), dtype=jnp.float32)
 
-        # Set up column mapping
-        self._column_names = list(columns)
-        self._column_mapping = {
-            name: idx for idx, name in enumerate(self._column_names)
-        }
-
-        # Initialize metadata for each column (no special types by default)
-        for col_name in self._column_names:
-            self._column_metadata[col_name] = {"dtype_flag": None}
-
-    def _init_from_jaxdf(self, df: "DataFrame"):
-        """Initialize from another JaxDataFrame."""
-        # NON-TRACEABLE SECTION: Copying from another JaxDataFrame
-        # These operations involve copying data structures and are not traceable.
-        # Copy internal array
-        self._values = jnp.array(df._values)
-
-        # Copy column info
-        self._column_names = df._column_names.copy()
-        self._column_mapping = df._column_mapping.copy()
-
-        # Copy metadata
-        self._column_metadata = {}
-        for col_name, metadata in df._column_metadata.items():
-            self._column_metadata[col_name] = metadata.copy()
-
-    def _init_from_dict(self, data_dict: Dict[str, Any]):  # noqa: PLR0912, PLR0915
-        """Initialize from a dictionary of arrays."""
-        # NON-TRACEABLE SECTION: Dictionary initialization
-        # These operations involve dictionary-specific operations and are not traceable.
-        if not data_dict:
-            # Empty dataframe
-            self._values = jnp.zeros((0, 0))
-            return
-
-        column_arrays = []
-        self._column_names = []
-
-        # Find the length of the arrays
-        array_length = None
-
-        # First pass to determine array length and validate
-        for col_name, values in data_dict.items():
-            # Convert to numpy array if needed
-            if isinstance(values, list):
-                values = np.array(values)  # noqa: PLW2901
-            elif isinstance(values, jax.Array):
-                values = np.array(values)  # noqa: PLW2901
-            elif isinstance(values, pd.DatetimeIndex):
-                # Handle DatetimeIndex by converting to nanosecond values
-                values = values.values  # noqa: PLW2901
-
-            if array_length is None:
-                array_length = len(values)
-            elif len(values) != array_length:
-                raise ValueError(
-                    f"""All arrays must have the same length. Column '{col_name}' has 
-                    length {len(values)}, expected {array_length}"""
+        # Step 10: Update index value mappings to include integer representations for special types
+        for col in self._index_columns:
+            if (
+                col in self._column_metadata
+                and self._column_metadata[col]["dtype_flag"] == DATETIME_TYPE_FLAG
+            ):
+                # Convert index values to nanosecond representation for internal use
+                self._index_values[col] = (
+                    pd.DatetimeIndex(self._index_values[col]).astype(np.int64).tolist()
                 )
-
-        # If no data was provided
-        if array_length is None:
-            self._values = jnp.zeros((0, 0))
-            return
-
-        # Process each column
-        for col_name, values in data_dict.items():
-            self._column_names.append(col_name)
-
-            # Check for special types
-            if isinstance(values, pd.Series):
-                # Handle pandas Series
-                if pd.api.types.is_datetime64_any_dtype(values.dtype):
-                    # Convert datetime to int64 nanoseconds
-                    array_values = values.astype(np.int64).values
-                    column_arrays.append(array_values)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": DATETIME_TYPE_FLAG,
-                    }
-                elif pd.api.types.is_string_dtype(
-                    values.dtype
-                ) or pd.api.types.is_categorical_dtype(values.dtype):  # type: ignore
-                    # Convert to categorical integers
-                    categories = values.astype("category").cat.categories.tolist()
-                    codes = values.astype("category").cat.codes.values
-                    column_arrays.append(codes)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": CATEGORY_TYPE_FLAG,
-                        "category_map": {i: val for i, val in enumerate(categories)},
-                    }
-                else:
-                    # Regular numeric data
-                    column_arrays.append(values.values)
-                    self._column_metadata[col_name] = {"dtype_flag": None}
-            elif isinstance(values, pd.DatetimeIndex):
-                # Handle DatetimeIndex
-                array_values = values.astype(np.int64).values
-                column_arrays.append(array_values)
-                self._column_metadata[col_name] = {
-                    "dtype_flag": DATETIME_TYPE_FLAG,
-                }
-            elif isinstance(values, (np.ndarray, jax.Array)):
-                # Handle numpy datetime arrays
-                if np.issubdtype(values.dtype, np.datetime64):
-                    array_values = values.astype(np.int64)
-                    column_arrays.append(array_values)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": DATETIME_TYPE_FLAG,
-                    }
-                else:
-                    # Simple array conversion
-                    column_arrays.append(values)
-                    self._column_metadata[col_name] = {"dtype_flag": None}
-            elif isinstance(values, list):
-                # Check if we have timestamp objects directly in the list
-                if all(isinstance(x, (pd.Timestamp)) for x in values if x is not None):
-                    # Convert pd.Timestamp objects to nanosecond values
-                    array_values = np.array(
-                        [x.value if x is not None else pd.NaT.value for x in values],
-                        dtype=np.int64,
-                    )
-                    column_arrays.append(array_values)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": DATETIME_TYPE_FLAG,
-                    }
-                # Check if list contains strings
-                elif all(isinstance(x, str) for x in values if x is not None):
-                    # Convert to categorical
-                    categories = list(
-                        dict.fromkeys([x for x in values if x is not None])
-                    )
-                    codes = [
-                        categories.index(x) if x is not None else -1 for x in values
-                    ]
-                    column_arrays.append(codes)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": CATEGORY_TYPE_FLAG,
-                        "category_map": {i: val for i, val in enumerate(categories)},
-                    }
-                # Check if list contains datetime objects
-                elif all(
-                    isinstance(x, (datetime.datetime, datetime.date))
-                    for x in values
-                    if x is not None
-                ):
-                    # Convert datetime objects to int64 nanoseconds
-                    dt_index = pd.DatetimeIndex([x for x in values if x is not None])
-                    int_values = np.array([x.astype(np.int64) for x in dt_index])  # type: ignore
-
-                    # Create array with NaT placeholders for None values
-                    full_array = np.full(len(values), pd.NaT.value, dtype=np.int64)
-                    non_none_idx = 0
-                    for i, val in enumerate(values):
-                        if val is not None:
-                            full_array[i] = int_values[non_none_idx]
-                            non_none_idx += 1
-
-                    column_arrays.append(full_array)
-                    self._column_metadata[col_name] = {
-                        "dtype_flag": DATETIME_TYPE_FLAG,
-                    }
-                else:
-                    # Regular numeric data
-                    column_arrays.append(values)
-                    self._column_metadata[col_name] = {"dtype_flag": None}
-            else:
-                raise TypeError(
-                    f"Unsupported data type for column '{col_name}': {type(values)}"
-                )
-
-        # Create column mapping
-        self._column_mapping = {
-            name: idx for idx, name in enumerate(self._column_names)
-        }
-
-        # Stack arrays into a single 2D array
-        self._values = jnp.column_stack(
-            [jnp.array(arr, dtype=jnp.float64) for arr in column_arrays]
-        )
+            # We don't need to convert categorical values here as we already have the integer mappings
 
     @property
-    def columns(self) -> List[str]:
-        """Get the column names."""
-        # NON-TRACEABLE SECTION: Column name access
-        # This operation involves accessing a list and is not traceable.
-        return self._column_names.copy()
-
-    @property
-    def shape(self) -> tuple:
-        """Get the shape of the dataframe."""
-        # TRACEABLE SECTION: Shape access
-        # This operation accesses a JAX array property and is traceable.
+    def shape(self) -> Tuple[int, int]:
+        """Return the shape of the DataFrame (rows, columns)."""
         return self._values.shape
 
     @property
-    def values(self) -> jax.Array:
-        """Get the underlying 2D JAX array."""
-        # TRACEABLE SECTION: Value access
-        # This operation returns a JAX array and is traceable.
-        return self._values
+    def columns(self) -> List[str]:
+        """Return the column names."""
+        return self._column_names.copy()
+
+    @property
+    def index_columns(self) -> List[str]:
+        """Return the index column names."""
+        return self._index_columns.copy()
+
+    def get_index_values(self, column: str) -> List:
+        """Return the unique values for an index column."""
+        if column not in self._index_columns:
+            raise ValueError(f"Column '{column}' is not an index column")
+        return self._index_values[column]
+
+    def __len__(self) -> int:
+        """Return the number of rows."""
+        return self._values.shape[0] if self._values is not None else 0
 
     def __getitem__(self, key: Union[str, List[str]]) -> Union[jax.Array, "DataFrame"]:
-        """Column access with explicit tracing phases."""
-        # Phase 1: Pre-processing (non-traceable)
+        """Column access."""
         if isinstance(key, str):
             if key not in self._column_mapping:
                 raise KeyError(f"Column '{key}' not found")
-            col_idx = self._column_mapping[key]
 
-            # Phase 2: Core computation (traceable)
-            values = self._getitem_single_core(self._values, col_idx)
-            # Phase 3: Post-processing (non-traceable)
-            return values
+            col_idx = self._column_mapping[key]
+            return self._values[:, col_idx]
 
         elif isinstance(key, list):
             if not all(k in self._column_mapping for k in key):
                 missing = [k for k in key if k not in self._column_mapping]
                 raise KeyError(f"Columns {missing} not found")
-            col_indices = [self._column_mapping[k] for k in key]
 
-            # Phase 2: Core computation (traceable)
-            values = self._getitem_multiple_core(self._values, jnp.array(col_indices))
+            # Create a new CartesianDataFrame with the selected columns
+            result = DataFrame.__new__(DataFrame)
 
-            # Phase 3: Post-processing (non-traceable)
-            result = DataFrame({})
+            # Copy index information
+            result._index_columns = self._index_columns.copy()
+            result._index_values = {k: v.copy() for k, v in self._index_values.items()}
+            result._index_mappings = {
+                k: v.copy() for k, v in self._index_mappings.items()
+            }
+            result._index_sizes = self._index_sizes.copy()
+
+            # Set up column information
             result._column_names = key.copy()
-            result._column_mapping = {name: idx for idx, name in enumerate(key)}
-            result._values = values
-            for col in key:
-                result._column_metadata[col] = self._column_metadata[col].copy()
+            result._column_mapping = {name: i for i, name in enumerate(key)}
+            result._column_dtypes = {
+                k: self._column_dtypes[k] for k in key if k in self._column_dtypes
+            }
+            result._column_metadata = {
+                k: self._column_metadata[k].copy()
+                for k in key
+                if k in self._column_metadata
+            }
+
+            # Copy values for the selected columns
+            col_indices = [self._column_mapping[k] for k in key]
+            result._values = self._values[:, col_indices]
+
             return result
+
         else:
             raise TypeError(f"Unsupported key type: {type(key)}")
 
     def __setitem__(self, key: str, value: Any):
-        """Column assignment with explicit tracing phases."""
-        # Phase 1: Pre-processing (non-traceable)
+        """
+        Set column values or add a new column.
+
+        Args:
+            key: Column name to set
+            value: Values to assign to the column
+        """
         if key in self._column_mapping:
+            # Update existing column
             col_idx = self._column_mapping[key]
-            metadata = self._column_metadata[key]
-            # Convert input to appropriate array type
-            value_array = self._prepare_column_values(key, value, metadata)
 
-            # Phase 2: Core computation (traceable)
-            self._values = self._setitem_core(self._values, col_idx, value_array)
+            # Convert value to a JAX array
+            value_array = self._prepare_values_for_assignment(value)
 
+            # Update the values
+            self._values = self._values.at[:, col_idx].set(value_array)
         else:
-            # Handle new column addition (purely non-traceable)
+            # Add a new column
             self.add_column(key, value)
 
-    # Keep these core traceable functions and helpers:
-    def _getitem_single_core(self, values: jax.Array, col_idx: int) -> jax.Array:
-        """Pure JAX function for single column access."""
-        return values[:, col_idx]
+    def _prepare_values_for_assignment(self, value: Any) -> jax.Array:
+        """
+        Convert a value to a JAX array suitable for assignment.
 
-    def _getitem_multiple_core(
-        self, values: jax.Array, col_indices: jax.Array
-    ) -> jax.Array:
-        """Pure JAX function for multiple column access."""
-        return values[:, col_indices]
+        Args:
+            value: Value to convert (scalar, list, numpy array, or JAX array)
 
-    def _setitem_core(
-        self, values: jax.Array, col_idx: int, new_values: jax.Array
-    ) -> jax.Array:
-        """Pure JAX function for column assignment."""
-        return values.at[:, col_idx].set(new_values)
+        Returns:
+            JAX array with appropriate shape
+
+        Raises:
+            ValueError: If the length of the value doesn't match the DataFrame length
+            TypeError: If the value type is not supported
+        """
+        if isinstance(value, (int, float, bool)):
+            # Broadcast scalar to all rows
+            return jnp.full(len(self), value, dtype=jnp.float32)
+        elif isinstance(value, (list, np.ndarray)):
+            if len(value) != len(self):
+                raise ValueError(
+                    f"Length of values ({len(value)}) does not match length of dataframe ({len(self)})"
+                )
+            return jnp.array(value, dtype=jnp.float32)
+        elif isinstance(value, jax.Array):
+            if value.shape[0] != len(self):
+                raise ValueError(
+                    f"Length of values ({value.shape[0]}) does not match length of dataframe ({len(self)})"
+                )
+            return value
+        else:
+            raise TypeError(f"Unsupported value type: {type(value)}")
 
     def add_column(self, col_name: str, value: Any):
         """
-        Add a new column to the dataframe (non-traceable).
-        This method is explicitly non-traceable as it changes the shape
-        of the underlying array and updates metadata structures.
+        Add a new column to the DataFrame.
 
         Args:
             col_name: Name of the new column
-            value: Values for the new column (array-like)
+            value: Values for the new column (scalar, list, numpy array, or JAX array)
+
+        Raises:
+            KeyError: If the column name already exists
         """
-        # Validate
         if col_name in self._column_mapping:
             raise KeyError(f"Column '{col_name}' already exists")
 
-        # Convert value to appropriate array type and infer metadata
-        metadata = {"dtype_flag": None}  # Default metadata
-        value_array = self._prepare_column_values(col_name, value, metadata)
+        # Convert value to a JAX array
+        value_array = self._prepare_values_for_assignment(value)
 
-        # Store old values
-        old_values = self._values
-
-        # Update metadata structures
+        # Update the column information
+        new_idx = len(self._column_names)
         self._column_names.append(col_name)
-        self._column_mapping = {
-            name: idx for idx, name in enumerate(self._column_names)
-        }
-        self._column_metadata[col_name] = metadata
+        self._column_mapping[col_name] = new_idx
 
-        # Special case for empty dataframe
-        if self._values.size == 0:
+        # Default metadata for the new column
+        self._column_dtypes[col_name] = np.float32
+        self._column_metadata[col_name] = {"dtype_flag": None}
+
+        # Add the new column to the values array
+        if self._values is None or self._values.size == 0:
+            # Handle empty DataFrame
             self._values = value_array.reshape(-1, 1)
         else:
-            # Stack new column (creates new array)
-            self._values = jnp.column_stack([old_values, value_array])
+            # Stack the new column
+            self._values = jnp.column_stack([self._values, value_array])
 
-    def _prepare_column_values(
-        self, col_name: str, value: Any, metadata: Dict[str, Any]
-    ) -> jax.Array:
+    def _get_index_position(self, **indices) -> int:
         """
-        Helper method to prepare column values for assignment.
-        Handles type conversion, special types detection, and validation.
+        Convert index values to a linear row index.
+
+        In our Cartesian grid, the rows are arranged in order of the Cartesian product
+        of all index columns.
 
         Args:
-            col_name: Name of column
-            value: Raw column values
-            metadata: Column metadata dict (may be modified in-place)
+            **indices: Index values for each index column
 
         Returns:
-            JAX array with properly converted values
+            Linear row index
         """
-        # Handle scalar values for broadcasting
-        if isinstance(value, (int, float, bool)):
-            # Create an array of the scalar value with the right length
-            value_array = jnp.full(len(self), value, dtype=jnp.float64)
-            metadata["dtype_flag"] = None
-            return value_array
+        # Check that all index columns are provided
+        for col in self._index_columns:
+            if col not in indices:
+                raise ValueError(f"Index column '{col}' not provided")
 
-        # Handle lists
-        elif isinstance(value, list):
-            if len(value) != len(self) and len(self) > 0:
-                raise ValueError(
-                    f"""Length of values ({len(value)}) does not match length of 
-                    dataframe ({len(self)})"""
-                )
+        # Convert index values to integer indices
+        index_indices = []
+        for col in self._index_columns:
+            val = indices[col]
+            if val not in self._index_mappings[col]:
+                raise ValueError(f"Value '{val}' not found in index column '{col}'")
+            idx = self._index_mappings[col][val]
+            index_indices.append(idx)
 
-            # Check for special types (strings or datetimes)
-            if all(isinstance(x, str) for x in value if x is not None):
-                # Convert to categorical
-                categories = list(dict.fromkeys([x for x in value if x is not None]))
-                codes = [categories.index(x) if x is not None else -1 for x in value]
-                value_array = jnp.array(codes, dtype=jnp.int32)
-
-                # Store category metadata
-                metadata["dtype_flag"] = CATEGORY_TYPE_FLAG
-                metadata["category_map"] = {i: val for i, val in enumerate(categories)}
-            elif all(
-                isinstance(x, (datetime.datetime, datetime.date))
-                for x in value
-                if x is not None
-            ):
-                # Convert datetime objects to int64 nanoseconds
-                dt_index = pd.DatetimeIndex([x for x in value if x is not None])
-                int_values = np.array([x.astype(np.int64) for x in dt_index])  # type: ignore
-
-                # Create array with NaT placeholders for None values
-                full_array = np.full(len(value), pd.NaT.value, dtype=np.int64)
-                non_none_idx = 0
-                for i, val in enumerate(value):
-                    if val is not None:
-                        full_array[i] = int_values[non_none_idx]
-                        non_none_idx += 1
-
-                value_array = jnp.array(full_array)
-                metadata["dtype_flag"] = DATETIME_TYPE_FLAG
+        # Compute linear index
+        # For a Cartesian product, the linear index is computed as:
+        # idx = idx_n + size_n * (idx_{n-1} + size_{n-1} * (... + size_1 * idx_0))
+        # This is essentially treating the indices as digits in a mixed-radix number system
+        linear_idx = 0
+        for i, col in enumerate(reversed(self._index_columns)):
+            if i == 0:
+                linear_idx = index_indices[-(i + 1)]
             else:
-                value_array = jnp.array(value, dtype=jnp.float64)
-                metadata["dtype_flag"] = None
-        elif isinstance(value, (np.ndarray, jax.Array)):
-            if len(value) != len(self) and len(self) > 0:
-                raise ValueError(
-                    f"""Length of values ({len(value)}) does not match length of 
-                    dataframe ({len(self)})"""
-                )
-            value_array = jnp.array(value, dtype=jnp.float64)
-            metadata["dtype_flag"] = None
-        else:
-            raise TypeError(
-                f"""Column value must be a numpy array, JAX array, list, or scalar. 
-                Got {type(value)}"""
+                linear_idx += index_indices[-(i + 1)]
+                linear_idx *= self._index_sizes[self._index_columns[-(i + 2)]]
+
+        return linear_idx
+
+    def _compute_strides(self) -> Dict[str, int]:
+        """
+        Compute strides for each index column.
+
+        For a Cartesian product, the stride for an index column is the product of the
+        sizes of all index columns to its right.
+
+        Returns:
+            Dictionary mapping index column names to strides
+        """
+        strides = {}
+        stride = 1
+        for col in reversed(self._index_columns):
+            strides[col] = stride
+            stride *= self._index_sizes[col]
+        return strides
+
+    def groupby(self, by: str) -> "GroupBy":
+        """
+        Group by an index column.
+
+        Args:
+            by: Name of an index column to group by
+
+        Returns:
+            CartesianGroupBy object
+        """
+        if by not in self._index_columns:
+            raise ValueError(
+                f"Column '{by}' is not an index column. "
+                f"Available index columns: {self._index_columns}"
             )
 
-        return value_array
+        return GroupBy(self, by)
 
-    def __len__(self) -> int:
-        """Number of rows in the dataframe."""
-        if self._values.size == 0:
-            return 0
-        return self._values.shape[0]
+    def apply(self, func: Callable, axis: int = 0) -> "DataFrame":
+        """
+        Apply a function along an axis.
+
+        Args:
+            func: JAX function to apply - function should take a JAX array and return a JAX array
+            axis: 0 for columns, 1 for rows
+
+        Returns:
+            DataFrame: Result of applying the function
+        """
+        # Prepare column mask for special types
+        special_cols_mask = jnp.array(
+            [
+                self._column_metadata[col].get("dtype_flag")
+                in [DATETIME_TYPE_FLAG, CATEGORY_TYPE_FLAG]
+                for col in self._column_names
+            ]
+        )
+
+        # Core computation based on axis
+        if axis == 0:
+            result_values = self._apply_columns_core(
+                self._values, special_cols_mask, func
+            )
+            # Use original column names
+            result_names = self._column_names.copy()
+        else:
+            result_values = self._apply_rows_core(self._values, func)
+            # For row operations, create a compound name with function name and original columns
+            func_name = getattr(func, "__name__", "lambda")
+            result_names = [f"{func_name}_{'_'.join(self._column_names)}"]
+            # Set the values and fix the column shape
+            result_values = result_values.reshape(-1, 1)
+
+        # Create result DataFrame
+        result = DataFrame.__new__(DataFrame)
+
+        # Copy index information
+        result._index_columns = self._index_columns.copy()
+        result._index_values = {k: v.copy() for k, v in self._index_values.items()}
+        result._index_mappings = {k: v.copy() for k, v in self._index_mappings.items()}
+        result._index_sizes = self._index_sizes.copy()
+
+        # Set up column information
+        result._column_names = result_names
+        result._column_mapping = {name: i for i, name in enumerate(result_names)}
+
+        # Set values
+        result._values = result_values
+
+        # Copy metadata for column-wise operations only
+        if axis == 0:
+            result._column_dtypes = {k: self._column_dtypes[k] for k in result_names}
+            result._column_metadata = {
+                k: self._column_metadata[k].copy() for k in result_names
+            }
+        else:
+            # For row operations, use default metadata
+            result._column_dtypes = {k: np.float32 for k in result_names}
+            result._column_metadata = {k: {"dtype_flag": None} for k in result_names}
+
+        return result
+
+    def _apply_columns_core(
+        self, values: jax.Array, special_cols_mask: jax.Array, func: Callable
+    ) -> jax.Array:
+        """Pure JAX function for column-wise apply (fully traceable)."""
+
+        def process_column(col_idx, values):
+            col_data = values[:, col_idx]
+            is_special = special_cols_mask[col_idx]
+            # Apply function only to non-special columns
+            result = jnp.where(is_special, col_data, func(col_data))
+            return result
+
+        # Process all columns with vmap
+        column_indices = jnp.arange(values.shape[1])
+        result_columns = jax.vmap(lambda idx: process_column(idx, values))(
+            column_indices
+        )
+
+        # Stack columns properly
+        return jnp.transpose(result_columns)
+
+    def _apply_rows_core(self, values: jax.Array, func: Callable) -> jax.Array:
+        """Pure JAX function for row-wise apply (fully traceable)."""
+        # Apply function to each row using vmap
+        result_values = jax.vmap(func)(values)
+
+        # Ensure result is always a column vector
+        def ensure_column_vector(x):
+            # First ensure we have a 1D array
+            flat = x.ravel()
+            # Then reshape to column vector
+            return flat.reshape(-1, 1)
+
+        return ensure_column_vector(result_values)
 
     def __repr__(self) -> str:
         """String representation similar to pandas."""
         return self.__str__()
 
     def __str__(self) -> str:  # noqa: PLR0912
-        """Formatted string representation."""
+        """Formatted string representation with index columns."""
         if len(self) == 0:
             return "Empty JaxDataFrame"
 
         # Format header
         header = f"JaxDataFrame: {self.shape[0]} rows × {self.shape[1]} columns"
         separator = "=" * len(header)
+
+        # Calculate widths for index columns
+        index_widths = {}
+        for col in self._index_columns:
+            index_widths[col] = max(len(col), 10)
+            # Check width needed for index values - format them properly based on type
+            for val in self._index_values[col]:
+                # Format value based on column type - add improved datetime detection
+                is_datetime = False
+                if col in self._column_metadata:
+                    is_datetime = (
+                        self._column_metadata[col].get("dtype_flag")
+                        == DATETIME_TYPE_FLAG
+                    )
+                if is_datetime:
+                    # For large integers, always try to convert to timestamps
+                    if isinstance(val, (int, np.int64)) and val > 1000000000000:
+                        val_str = str(pd.Timestamp(val))
+                    else:
+                        val_str = str(val)
+                else:
+                    val_str = str(val)
+                index_widths[col] = max(index_widths[col], len(val_str))
 
         # Column names row
         col_names = self._column_names
@@ -580,8 +637,50 @@ class DataFrame:
                 col_widths[col] = max(col_widths[col], len(val_str))
             formatted_values[col] = formatted_vals
 
-        # Create header row
-        header_row = "    " + "  ".join(col.ljust(col_widths[col]) for col in col_names)
+        # Create header row with index columns
+        index_part = "    " + "  ".join(
+            col.ljust(index_widths[col]) for col in self._index_columns
+        )
+        if self._index_columns:
+            index_part += "  "  # Add spacing between index and data columns
+        header_row = index_part + "  ".join(
+            col.ljust(col_widths[col]) for col in col_names
+        )
+
+        # Calculate index values for each row
+        def get_index_values_for_row(row_idx):
+            """Convert row index back to index values."""
+            idx_values = {}
+            remaining_idx = row_idx
+
+            # Using the strides to calculate index values
+            strides = self._compute_strides()
+
+            for col in self._index_columns:
+                size = self._index_sizes[col]
+                stride = strides[col]
+                col_idx = (remaining_idx // stride) % size
+                remaining_idx %= stride
+
+                # Get the actual value from the index
+                raw_val = self._index_values[col][col_idx]
+
+                # Format the value based on column type - with better detection
+                if (
+                    col in self._column_metadata
+                    and self._column_metadata[col].get("dtype_flag")
+                    == DATETIME_TYPE_FLAG
+                ):
+                    # Always treat large integers as potential timestamps
+                    if isinstance(raw_val, (int, np.int64)) and raw_val > 1000000000000:
+                        # Convert nanosecond int to pandas Timestamp
+                        idx_values[col] = pd.Timestamp(raw_val)
+                    else:
+                        idx_values[col] = raw_val
+                else:
+                    idx_values[col] = raw_val
+
+            return idx_values
 
         # Build the table rows
         max_rows = 10  # Maximum rows to display
@@ -590,6 +689,18 @@ class DataFrame:
         if len(self) <= max_rows:
             # Show all rows
             for i in range(len(self)):
+                # Get index values for this row
+                idx_values = get_index_values_for_row(i)
+
+                # Format index part
+                index_part = "  ".join(
+                    str(idx_values[col]).ljust(index_widths[col])
+                    for col in self._index_columns
+                )
+                if self._index_columns:
+                    index_part += "  "  # Add spacing between index and data columns
+
+                # Format data values
                 row_vals = []
                 for col in col_names:
                     if i < len(formatted_values[col]):
@@ -597,10 +708,27 @@ class DataFrame:
                     else:
                         val = self._format_value(col, i)
                     row_vals.append(val.ljust(col_widths[col]))
-                table_rows.append(f"{i:3d} " + "  ".join(row_vals))
+
+                # Combine into one row
+                if self._index_columns:
+                    table_rows.append(f"{i:3d} {index_part}" + "  ".join(row_vals))
+                else:
+                    table_rows.append(f"{i:3d} " + "  ".join(row_vals))
         else:
             # Show first and last few rows
             for i in range(5):
+                # Get index values for this row
+                idx_values = get_index_values_for_row(i)
+
+                # Format index part
+                index_part = "  ".join(
+                    str(idx_values[col]).ljust(index_widths[col])
+                    for col in self._index_columns
+                )
+                if self._index_columns:
+                    index_part += "  "  # Add spacing between index and data columns
+
+                # Format data values
                 row_vals = []
                 for col in col_names:
                     if i < len(formatted_values[col]):
@@ -608,21 +736,64 @@ class DataFrame:
                     else:
                         val = self._format_value(col, i)
                     row_vals.append(val.ljust(col_widths[col]))
-                table_rows.append(f"{i:3d} " + "  ".join(row_vals))
 
+                # Combine into one row
+                if self._index_columns:
+                    table_rows.append(f"{i:3d} {index_part}" + "  ".join(row_vals))
+                else:
+                    table_rows.append(f"{i:3d} " + "  ".join(row_vals))
+
+            # Add separator row
+            index_ellipsis = "  ".join(
+                "...".ljust(index_widths[col]) for col in self._index_columns
+            )
+            if self._index_columns:
+                index_ellipsis += "  "
             table_rows.append(
-                "... " + "  ".join("...".ljust(col_widths[col]) for col in col_names)
+                "... "
+                + index_ellipsis
+                + "  ".join("...".ljust(col_widths[col]) for col in col_names)
             )
 
             for i in range(len(self) - 5, len(self)):
+                # Get index values for this row
+                idx_values = get_index_values_for_row(i)
+
+                # Format index part
+                index_part = "  ".join(
+                    str(idx_values[col]).ljust(index_widths[col])
+                    for col in self._index_columns
+                )
+                if self._index_columns:
+                    index_part += "  "  # Add spacing between index and data columns
+
+                # Format data values
                 row_vals = []
                 for col in col_names:
                     val = self._format_value(col, i)
                     row_vals.append(val.ljust(col_widths[col]))
-                table_rows.append(f"{i:3d} " + "  ".join(row_vals))
+
+                # Combine into one row
+                if self._index_columns:
+                    table_rows.append(f"{i:3d} {index_part}" + "  ".join(row_vals))
+                else:
+                    table_rows.append(f"{i:3d} " + "  ".join(row_vals))
 
         # Column type information
         type_info = []
+        # Add index column types
+        for col in self._index_columns:
+            metadata = self._column_metadata[col]
+            if metadata["dtype_flag"] == DATETIME_TYPE_FLAG:
+                type_str = "datetime64[ns]"
+            elif metadata["dtype_flag"] == CATEGORY_TYPE_FLAG:
+                num_cats = len(self._index_values[col])
+                type_str = f"category({num_cats})"
+            else:
+                type_str = "object"
+            type_info.append(f"{col} (index): {type_str}")
+
+        # Add data column types
         for col in col_names:
             metadata = self._column_metadata[col]
             if metadata["dtype_flag"] == DATETIME_TYPE_FLAG:
@@ -678,1175 +849,338 @@ class DataFrame:
         else:
             return str(val)
 
-    def head(self, n: int = 5) -> "DataFrame":
-        """
-        Return the first n rows.
-
-        Args:
-            n: Number of rows to return
-
-        Returns:
-            JaxDataFrame: First n rows
-        """
-        if len(self) == 0:
-            return DataFrame({})
-
-        n = min(n, len(self))
-
-        # Create a new dataframe with the first n rows
-        result = DataFrame({})
-        result._column_names = self._column_names.copy()
-        result._column_mapping = self._column_mapping.copy()
-        result._values = self._values[:n, :]
-
-        # Copy column metadata
-        for col, metadata in self._column_metadata.items():
-            result._column_metadata[col] = metadata.copy()
-
-        return result
-
-    def tail(self, n: int = 5) -> "DataFrame":
-        """
-        Return the last n rows.
-
-        Args:
-            n: Number of rows to return
-
-        Returns:
-            JaxDataFrame: Last n rows
-        """
-        if len(self) == 0:
-            return DataFrame({})
-
-        n = min(n, len(self))
-
-        # Create a new dataframe with the last n rows
-        result = DataFrame({})
-        result._column_names = self._column_names.copy()
-        result._column_mapping = self._column_mapping.copy()
-        result._values = self._values[-n:, :]
-
-        # Copy column metadata
-        for col, metadata in self._column_metadata.items():
-            result._column_metadata[col] = metadata.copy()
-
-        return result
-
-    def apply(self, func: Callable, axis: int = 0) -> "DataFrame":
-        """
-        Apply a function along an axis.
-
-        Args:
-            func: JAX function to apply - function should take a JAX array and return
-                a JAX array
-            axis: 0 for columns, 1 for rows
-
-        Returns:
-            JaxDataFrame: Result of applying the function
-        """
-        # Phase 1: Pre-processing (non-traceable)
-        special_cols_mask = jnp.array(
-            [
-                self._column_metadata[col]["dtype_flag"]
-                in [DATETIME_TYPE_FLAG, CATEGORY_TYPE_FLAG]
-                for col in self._column_names
-            ]
-        )
-
-        # Phase 2: Core computation (fully traceable)
-        if axis == 0:
-            result_values = self._apply_columns_core(
-                self._values, special_cols_mask, func
-            )
-            # Use original column names
-            result_names = self._column_names
-        else:
-            result_values = self._apply_rows_core(self._values, func)
-            # For row operations, create a compound name with function name and
-            # original columns
-            func_name = getattr(func, "__name__", "lambda")
-            if isinstance(func, type(lambda: None)):
-                func_name = "lambda"
-            # Create name that combines function name with original column names
-            result_names = [f"{func_name}_{'_'.join(self._column_names)}"]
-            # Set the values and fix the column mapping
-            result_values = result_values.reshape(-1, 1)
-
-        # Phase 3: Post-processing (non-traceable)
-        result = DataFrame({})
-        result._column_names = result_names
-        result._column_mapping = {name: idx for idx, name in enumerate(result_names)}
-        result._values = result_values
-
-        # Copy metadata for column-wise operations only
-        if axis == 0:
-            for col, metadata in self._column_metadata.items():
-                result._column_metadata[col] = metadata.copy()
-        else:
-            # For row operations, use default metadata
-            for col in result_names:
-                result._column_metadata[col] = {"dtype_flag": None}
-
-        return result
-
-    def _apply_columns_core(
-        self, values: jax.Array, special_cols_mask: jax.Array, func: Callable
-    ) -> jax.Array:
-        """Pure JAX function for column-wise apply (fully traceable)."""
-
-        def process_column(col_idx, values):
-            col_data = values[:, col_idx]
-            mask_val = special_cols_mask[col_idx]
-            # Apply function only to non-special columns
-            result = jnp.where(mask_val, col_data, func(col_data))
-            return result
-
-        # Process all columns with vmap
-        column_indices = jnp.arange(values.shape[1])
-        result_columns = jax.vmap(lambda idx: process_column(idx, values))(
-            column_indices
-        )
-
-        # Stack columns properly
-        return jnp.transpose(result_columns)  # type: ignore
-
-    def _apply_rows_core(self, values: jax.Array, func: Callable) -> jax.Array:
-        """Pure JAX function for row-wise apply (fully traceable)."""
-        # Apply function to each row using vmap
-        result_values = jax.vmap(func)(values)
-
-        # Ensure result is always a column vector (n x 1)
-        def ensure_column_vector(x):
-            # First ensure we have a 1D array
-            flat = x.ravel()
-            # Then reshape to column vector
-            return flat.reshape(-1, 1)
-
-        # Always reshape to column vector - no conditional needed
-        return ensure_column_vector(result_values)
-
-    def rolling(self, window_size: int, min_periods: Optional[int] = None) -> "Rolling":
-        """
-        Create a rolling window view of the dataframe.
-
-        Args:
-            window_size: Size of the rolling window
-            min_periods: Minimum number of observations required to have a value.
-                         If None, defaults to window_size.
-
-        Returns:
-            JaxRollingDF: A rolling window object for the dataframe
-        """
-        return Rolling(self, window_size, min_periods)
-
-    def groupby(self, by: Union[str, Callable]) -> "GroupBy":
-        """
-        Group the dataframe by a column.
-
-        Args:
-            by: Column name to group by
-
-        Returns:
-            JaxGroupBy: A groupby object
-        """
-        return GroupBy(self, by)
-
-    def to_pandas(self) -> pd.DataFrame:
-        """
-        Convert JaxDataFrame to pandas DataFrame.
-
-        Returns:
-            pandas.DataFrame: Pandas equivalent of this dataframe
-        """
-        data = {}
-
-        for col in self._column_names:
-            col_idx = self._column_mapping[col]
-            col_values = np.array(self._values[:, col_idx])
-            metadata = self._column_metadata[col]
-
-            if metadata["dtype_flag"] == DATETIME_TYPE_FLAG:
-                # Convert from nanoseconds to pandas datetime
-                data[col] = pd.to_datetime(col_values, unit="ns")
-            elif metadata["dtype_flag"] == CATEGORY_TYPE_FLAG:
-                # Convert from category codes to original strings
-                cat_map = metadata["category_map"]
-                strings = []
-                for code in col_values:
-                    string_val = (
-                        cat_map.get(int(code), None)
-                        if code >= 0 and not np.isnan(code)
-                        else None
-                    )
-                    strings.append(string_val)
-                data[col] = pd.Categorical(strings)
-            else:
-                data[col] = col_values
-
-        # Create DataFrame
-        return pd.DataFrame(data)
-
-    @classmethod
-    def from_numpy(cls, array: np.ndarray, columns: List[str]) -> "DataFrame":
-        """Create a JaxDataFrame from a 2D numpy array."""
-        return cls(array, columns=columns)
-
-    @classmethod
-    def from_jax(cls, array: jax.Array, columns: List[str]) -> "DataFrame":
-        """Create a JaxDataFrame from a 2D JAX array."""
-        return cls(array, columns=columns)
-
-    @classmethod
-    def from_pandas(cls, df: pd.DataFrame) -> "DataFrame":
-        """Create a JaxDataFrame from a pandas DataFrame."""
-        return cls(df)
-
-
-class Rolling:
-    """Represents a rolling window over a JaxDataFrame."""
-
-    def __init__(
-        self, df: DataFrame, window_size: int, min_periods: Optional[int] = None
-    ):
-        """
-        Initialize a rolling window for a dataframe.
-
-        Args:
-            df: The JaxDataFrame to create windows from
-            window_size: Size of each window
-            min_periods: Minimum num of observations in window required to have a value.
-                         If None, defaults to window_size.
-        """
-        self.df = df
-        self.window_size = window_size
-        # Set min_periods to window_size if None (pandas default behavior)
-        self.min_periods = min_periods if min_periods is not None else window_size
-
-    def apply(self, func: Callable) -> DataFrame:
-        """
-        Apply a JAX function to each window of each column, in a traceable manner.
-
-        Args:
-            func: A JAX-compatible function to apply to each window
-
-        Returns:
-            JaxDataFrame: Result of applying the function
-        """
-        # Phase 1: Pre-processing (non-traceable)
-        # Convert column flags to boolean mask array for tracing
-        process_mask = self._prepare_column_mask()
-
-        # Convert inputs to arrays for core computation
-        input_values = self.df._values
-        window_size = self.window_size
-
-        # Phase 2: Core computation (fully traceable)
-        result_values = self._apply_core(input_values, process_mask, window_size, func)
-
-        # Phase 3: Post-processing (non-traceable)
-        return self._wrap_result(result_values)
-
-    def _prepare_column_mask(self) -> jax.Array:
-        """Create boolean mask for processable columns (non-traceable)."""
-        process_mask = []
-        for col in self.df._column_names:
-            metadata = self.df._column_metadata[col]
-            should_process = metadata["dtype_flag"] not in [
-                DATETIME_TYPE_FLAG,
-                CATEGORY_TYPE_FLAG,
-            ]
-            process_mask.append(should_process)
-        return jnp.array(process_mask)
-
-    def _apply_core(
-        self,
-        values: jax.Array,
-        process_mask: jax.Array,
-        window_size: int,
-        func: Callable,
-    ) -> jax.Array:
-        """Pure JAX implementation of rolling window computation (fully traceable)."""
-        n_rows, n_cols = values.shape
-
-        def process_column(col_idx):
-            col_data = values[:, col_idx]
-            should_process = process_mask[col_idx]
-
-            def process_window_at_position(row_idx):
-                """Process the window at a specific position in the column."""
-                # Calculate the valid window for this position
-                start_pos = jnp.maximum(0, row_idx - window_size + 1)
-                window_buffer = jnp.zeros(window_size)
-                valid_mask = jnp.zeros(window_size, dtype=jnp.bool_)
-
-                # Fill window with values using fori_loop
-                def fill_window_element(i, carry):
-                    buffer, mask = carry
-                    src_idx = start_pos + i
-                    # Check if index is valid (within bounds and within window)
-                    valid = jnp.logical_and(
-                        jnp.logical_and(src_idx >= 0, src_idx < n_rows),
-                        src_idx <= row_idx,
-                    )
-                    value = jnp.where(valid, col_data[src_idx], 0.0)
-                    buffer_val = buffer.at[i].set(value)
-
-                    # Also mark NaN values as invalid for min_periods calculations
-                    is_valid_value = jnp.logical_and(valid, ~jnp.isnan(value))
-                    mask_val = mask.at[i].set(is_valid_value)
-
-                    return buffer_val, mask_val
-
-                # Fill window
-                buffer, mask = jax.lax.fori_loop(
-                    0, window_size, fill_window_element, (window_buffer, valid_mask)
-                )
-
-                # Determine if we have a full window
-                is_full_window = row_idx >= (window_size - 1)
-
-                # Process window using the appropriate masking strategy
-                return self._process_window(
-                    buffer,
-                    mask,
-                    func,
-                    col_data[row_idx],  # type: ignore
-                    is_full_window,
-                )
-
-            # Apply the window processor to all positions
-            result = jax.vmap(process_window_at_position)(jnp.arange(n_rows))
-
-            # Only apply processing to appropriate columns
-            return jnp.where(should_process, result, col_data)
-
-        # Process all columns
-        result_columns = jax.vmap(process_column)(jnp.arange(n_cols))
-        return jnp.transpose(result_columns)
-
-    def _fill_window_element(  # noqa: PLR0913
-        self,
-        i: int,
-        carry: tuple,
-        start_pos: int,
-        col_data: jax.Array,
-        n_rows: int,
-        current_pos: int,
-    ) -> tuple:
-        """Pure function for filling single window element (traceable)."""
-        buffer, mask = carry
-        src_idx = start_pos + i
-
-        # The element is valid if:
-        # 1. It's within the bounds of the data (src_idx < n_rows)
-        # 2. It's within the rolling window (src_idx <= current_pos)
-        valid = jnp.logical_and(
-            jnp.logical_and(src_idx >= 0, src_idx < n_rows), src_idx <= current_pos
-        )
-
-        value = jnp.where(valid, col_data[src_idx], 0.0)
-        return (buffer.at[i].set(value), mask.at[i].set(valid))
-
-    def _process_window(
-        self,
-        buffer: jax.Array,
-        mask: jax.Array,
-        func: Callable,
-        original_value: float,
-        is_full_window: bool,
-    ) -> float:
-        """Pure function for window processing (traceable)."""
-        valid_count = jnp.sum(mask)
-
-        # Using pandas rules for rolling windows:
-        # 1. If min_periods is None or equals window_size (default):
-        #    - Return NaN until a full window is available
-        # 2. If min_periods is specified:
-        #    - Return NaN unless we have at least min_periods valid values
-
-        # Check if we have enough valid observations
-        has_min_periods = valid_count >= self.min_periods
-
-        # For default behavior, we need a full window
-        using_default = self.min_periods == self.window_size
-        meets_default_requirements = is_full_window
-
-        # We can calculate if:
-        # 1. Using custom min_periods and have enough valid values, OR
-        # 2. Using default behavior and have a full window with enough valid values
-        can_calculate = jax.lax.cond(
-            using_default,
-            lambda _: jnp.logical_and(meets_default_requirements, has_min_periods),
-            lambda _: has_min_periods,
-            None,
-        )
-
-        # Use lax.cond for maximum traceability
-        return jax.lax.cond(
-            can_calculate,
-            lambda _: self._apply_with_masking(func, buffer, mask),
-            lambda _: jnp.nan,
-            None,
-        )
-
-    def _wrap_result(self, result_values: jax.Array) -> DataFrame:
-        """Construct result DataFrame (non-traceable)."""
-        result_df = DataFrame({})
-        result_df._column_names = self.df._column_names.copy()
-        result_df._column_mapping = self.df._column_mapping.copy()
-        result_df._values = result_values
-
-        # Copy column metadata
-        for col, metadata in self.df._column_metadata.items():
-            result_df._column_metadata[col] = metadata.copy()
-
-        return result_df
-
-    def _apply_with_masking(
-        self, fn: Callable, values: jax.Array, mask: jax.Array
-    ) -> float:
-        """
-        Apply function to masked values in a JAX-traceable way.
-
-        Args:
-            fn: JAX-compatible function to apply
-            values: Window values array
-            mask: Boolean mask array indicating valid values
-
-        Returns:
-            JAX array: Result of applying function to masked values
-
-        Note:
-            This is a pure function and fully traceable.
-        """
-        # For nanmean and similar functions, we need to:
-        # 1. Replace invalid positions with NaN (determined by mask)
-        # 2. Replace existing NaN values with NaN (even if they're in valid positions)
-
-        # First mask out invalid positions
-        masked_values = jnp.where(mask, values, jnp.nan)
-
-        # Apply the function (which should handle NaNs properly like nanmean, nansum..)
-        result = fn(masked_values)
-
-        # If no valid values or all values are NaN, return NaN
-        all_nan = jnp.logical_or(jnp.all(jnp.isnan(masked_values)), ~jnp.any(mask))
-        return jax.lax.cond(all_nan, lambda _: jnp.nan, lambda _: result, None)
-
 
 class GroupBy:
-    """Represents a groupby operation on a JaxDataFrame."""
+    """
+    GroupBy implementation for CartesianDataFrame that works with JAX tracing.
 
-    def __init__(self, df: DataFrame, by: Union[str, Callable]):
+    This implementation leverages the Cartesian structure to avoid boolean indexing
+    and make operations fully traceable.
+    """
+
+    def __init__(self, df: DataFrame, by: str):
         """
-        Initialize a groupby object.
+        Initialize GroupBy operation.
 
         Args:
-            df: The JaxDataFrame to group
-            by: Column name or function to group by
-
-        Note:
-            This initialization is NOT JAX-traceable because it involves:
-            - Dynamic Python data structure creation
-            - Runtime shape discovery
-            - Python control flow based on data values
+            df: CartesianDataFrame to group
+            by: Index column to group by
         """
-        # NON-TRACEABLE SECTION: Initialization and group discovery
         self.df = df
         self.by = by
 
-        # Determine grouping values
-        if isinstance(by, str):
-            # Group by column
-            if by not in df.columns:
-                raise KeyError(f"Column '{by}' not found")
-            col_idx = df._column_mapping[by]
-            self.grouping_values = df._values[:, col_idx]
-            self.by_metadata = df._column_metadata[by]
-        elif callable(by):
-            # Group by function applied to the dataframe
-            self.grouping_values = by(df._values)
-            self.by_metadata = {"dtype_flag": None}
-        else:
-            raise TypeError(f"Unsupported groupby type: {type(by)}")
+        # Compute strides for each index column
+        self._strides = df._compute_strides()
 
-        # Find unique groups and their indices - THIS IS NOT TRACEABLE
-        # Must be done during initialization (non-traceable phase)
-        self.unique_groups, self.group_indices = self._compute_groups()
+        # Get information for the groupby column
+        self.values = df._index_values[by]
+        self.n_groups = df._index_sizes[by]
 
-        # Create group ID mapping - map each row to its group ID
-        # This helps make the apply function more traceable
-        self.group_ids = self._create_group_id_mapping()
+        # Compute the size of each group
+        # This is the product of the sizes of all other index columns
+        self.group_size = 1
+        for col in df._index_columns:
+            if col != by:
+                self.group_size *= df._index_sizes[col]
 
-    def _compute_groups(self) -> tuple:
-        """
-        Compute unique groups and their indices (NON-TRACEABLE).
-        Returns a tuple of (unique_groups, group_indices_dict)
-        """
-        from jax.experimental import io_callback
-
-        result_shape = jax.ShapeDtypeStruct(
-            self.grouping_values.shape, self.grouping_values.dtype
-        )
-        grouping_concrete = io_callback(lambda x: x, result_shape, self.grouping_values)
-        grouping_np = np.array(jax.device_get(grouping_concrete))
-        unique_groups = np.unique(grouping_np)
-        group_indices = {}
-        for group in unique_groups:
-            mask = grouping_np == group
-            indices = np.where(mask)[0]
-            if len(indices) > 0:
-                group_indices[float(group)] = indices
-        return jnp.array(unique_groups), group_indices
-
-    def _create_group_id_mapping(self) -> jax.Array:
-        """
-        Create a mapping from row index to group ID (NON-TRACEABLE).
-        This will help make apply operations more traceable.
-        """
-        n_rows = len(self.df)
-        # Initialize with -1 (invalid group)
-        group_ids = np.full(n_rows, -1)
-
-        # Assign group IDs (position in unique_groups) to each row
-        for idx, group in enumerate(self.unique_groups):
-            group_val = float(group)
-            if group_val in self.group_indices:
-                row_indices = self.group_indices[group_val]
-                group_ids[row_indices] = idx
-
-        return jnp.array(group_ids)
-
-    def __getitem__(self, key: Union[str, List[str]]) -> "GroupBy":
-        """
-        Select columns from the grouped data (NON-TRACEABLE).
-
-        Args:
-            key: Column name or list of column names
-
-        Returns:
-            JaxGroupBy with selected columns
-        """
-        # NON-TRACEABLE: This method constructs new Python objects and uses
-        # dynamic data selection
-        if isinstance(key, str):
-            # Create a copy of self with specified column
-            if key not in self.df.columns:
-                raise KeyError(f"Column '{key}' not found")
-
-            # Create a new dataframe with just the structure/metadata
-            selected_df = DataFrame({})
-
-            # Determine which columns to include
-            columns_to_include = [key]
-            if (
-                isinstance(self.by, str)
-                and self.by != key
-                and self.by in self.df.columns
-            ):
-                columns_to_include.insert(0, self.by)  # Put groupby column first
-
-            # Set up column names and mapping
-            selected_df._column_names = columns_to_include
-            selected_df._column_mapping = {
-                name: idx for idx, name in enumerate(columns_to_include)
-            }
-
-            # Create values array
-            col_arrays = []
-            for col in columns_to_include:
-                col_idx = self.df._column_mapping[col]
-                col_arrays.append(self.df._values[:, col_idx])
-
-            selected_df._values = jnp.column_stack(col_arrays)
-
-            # Copy metadata for all columns
-            for col in columns_to_include:
-                selected_df._column_metadata[col] = self.df._column_metadata[col].copy()
-
-            # Create a new GroupBy object with the selected columns
-            result = GroupBy(selected_df, self.by)
-            result.grouping_values = self.grouping_values
-            result.by_metadata = self.by_metadata
-            result.unique_groups = self.unique_groups
-            result.group_indices = self.group_indices
-            return result
-        elif isinstance(key, list):
-            # Multiple column selection
-            if not all(col in self.df.columns for col in key):
-                missing = [col for col in key if col not in self.df.columns]
-                raise KeyError(f"Columns {missing} not found")
-
-            # Create a new dataframe with just the structure/metadata
-            selected_df = DataFrame({})
-
-            # Determine which columns to include, ensuring groupby column
-            # is included and first
-            columns_to_include = key.copy()
-            if (
-                isinstance(self.by, str)
-                and self.by not in columns_to_include
-                and self.by in self.df.columns
-            ):
-                columns_to_include.insert(0, self.by)
-
-            # Set up column names and mapping
-            selected_df._column_names = columns_to_include
-            selected_df._column_mapping = {
-                name: idx for idx, name in enumerate(columns_to_include)
-            }
-
-            # Create values array
-            col_arrays = []
-            for col in columns_to_include:
-                col_idx = self.df._column_mapping[col]
-                col_arrays.append(self.df._values[:, col_idx])
-
-            selected_df._values = jnp.column_stack(col_arrays)
-
-            # Copy metadata for all columns
-            for col in columns_to_include:
-                selected_df._column_metadata[col] = self.df._column_metadata[col].copy()
-
-            # Create a new GroupBy object with the selected columns
-            result = GroupBy(selected_df, self.by)
-            result.grouping_values = self.grouping_values
-            result.by_metadata = self.by_metadata
-            result.unique_groups = self.unique_groups
-            result.group_indices = self.group_indices
-            return result
-        else:
-            raise TypeError(f"Unsupported key type: {type(key)}")
-
-    def rolling(self, window_size: int) -> "GroupByRolling":
-        """
-        Create a rolling window view of the grouped dataframe (NON-TRACEABLE init).
-
-        Args:
-            window_size: Size of the rolling window
-
-        Returns:
-            JaxGroupByRolling: A rolling window object for the grouped dataframe
-        """
-        # NON-TRACEABLE: This method constructs a new Python object
-        return GroupByRolling(self, window_size)
-
-    def aggregate(self, func: Callable) -> DataFrame:  # noqa: PLR0912
-        """
-        Apply an aggregation function to each group (fully traceable).
-        This explicitly treats the function as an aggregation (e.g. mean, sum, max),
-        which will return one row per group.
-
-        Args:
-            func: A pure JAX reduction function that takes an array and returns a scalar
-
-        Returns:
-            JaxDataFrame: One row per group with aggregated values
-        """
-        # Phase 1: Pre-processing (non-traceable)
-        columns = self.df._column_names
-        by_col_idx = (
-            self.df._column_mapping[self.by] if isinstance(self.by, str) else None
-        )
-
-        # Initialize output data structure
-        agg_data = {}
-
-        # Handle the groupby column specially
-        if isinstance(self.by, str):
-            # Just use the unique groups as values
-            agg_data[self.by] = jnp.array(self.unique_groups)
-
-        # Prepare data for core computation
-        core_data = []
-        core_metadata = []
-        for col_idx, col_name in enumerate(columns):
-            # Skip the groupby column as we already handled it
-            if isinstance(self.by, str) and col_idx == by_col_idx:
-                continue
-
-            metadata = self.df._column_metadata[col_name]
-
-            # For special types, store the column index and metadata
-            if metadata["dtype_flag"] in [DATETIME_TYPE_FLAG, CATEGORY_TYPE_FLAG]:
-                core_data.append((col_idx, metadata))
-            else:
-                # For regular columns, add the data to the core data list
-                col_data = self.df._values[:, col_idx]
-                core_data.append(col_data)
-            core_metadata.append(col_name)
-
-        # Phase 2: Core computation (fully traceable)
-        agg_results = self._aggregate_core(core_data, func)
-
-        # Phase 3: Post-processing (non-traceable)
-        # Assign aggregated results to the output data structure
-        result_idx = 0
-        for col_idx, col_name in enumerate(columns):
-            # Skip the groupby column as we already handled it
-            if isinstance(self.by, str) and col_idx == by_col_idx:
-                continue
-
-            metadata = self.df._column_metadata[col_name]
-
-            # For special types, take the first value from each group
-            if metadata["dtype_flag"] in [DATETIME_TYPE_FLAG, CATEGORY_TYPE_FLAG]:
-                col_results = []
-                for _, group in enumerate(self.unique_groups):
-                    group_float = float(group)
-                    indices = self.group_indices.get(group_float, [])
-                    if len(indices) > 0:
-                        col_results.append(self.df._values[indices[0], col_idx])
-                    # Use a placeholder for empty groups
-                    elif metadata["dtype_flag"] == DATETIME_TYPE_FLAG:
-                        col_results.append(pd.NaT.value)
-                    else:
-                        col_results.append(-1)  # None category
-
-                agg_data[col_name] = jnp.array(col_results)
-            else:
-                # Assign aggregated results to the output data structure
-                agg_data[col_name] = agg_results[result_idx]
-                result_idx += 1
-
-        # Create result DataFrame
-        result_df = DataFrame(agg_data)
-
-        # Copy metadata for special columns
-        for col_name, metadata in self.df._column_metadata.items():
-            if col_name in result_df._column_metadata:
-                result_df._column_metadata[col_name] = metadata.copy()
-
-        return result_df
+        # Get the stride for the groupby column
+        self.stride = self._strides[by]
 
     def transform(self, func: Callable) -> DataFrame:
         """
-        Apply a transformation function to each group (partly traceable).
-        This explicitly treats the function as a transformation that returns an array
-        of the same size as its input, resulting in a DataFrame of the same shape as
-        the original.
+        Apply a transformation function to each group.
+
+        This method is fully traceable and can be used in JIT-compiled functions.
 
         Args:
-            func: A JAX-compatible transformation function that takes an array and
-                    returns an array of the same length
+            func: Function to apply to each group
 
         Returns:
-            JaxDataFrame: Same shape as input with transformed values
+            CartesianDataFrame with transformed values
         """
-        # Phase 1: Pre-processing (non-traceable)
-        columns = self.df._column_names
-        by_col_idx = (
-            self.df._column_mapping[self.by] if isinstance(self.by, str) else None
-        )
-
-        # Prepare data for core computation
-        core_data = []
-        core_metadata = []
-        for col_idx, col_name in enumerate(columns):
-            # Skip the groupby column and special type columns
-            if (
-                isinstance(self.by, str) and col_idx == by_col_idx
-            ) or self.df._column_metadata[col_name]["dtype_flag"] in [
-                DATETIME_TYPE_FLAG,
-                CATEGORY_TYPE_FLAG,
-            ]:
-                continue
-
-            # Get column data
-            col_data = self.df._values[:, col_idx]
-            core_data.append(col_data)
-            core_metadata.append(col_name)
-
-        # Phase 2: Core computation (fully traceable)
-        transformed_values = self._transformation_core(core_data, func)
-
-        # Phase 3: Post-processing (non-traceable)
-        # Start with a copy of the input values
-        result_values = jnp.array(self.df._values)
-        result_idx = 0
-
-        # We use a non-traceable outer loop over groups with traceable inner operations
-        # Process each column
-        for col_idx, col_name in enumerate(columns):
-            # Skip the groupby column and special type columns
-            if (
-                isinstance(self.by, str) and col_idx == by_col_idx
-            ) or self.df._column_metadata[col_name]["dtype_flag"] in [
-                DATETIME_TYPE_FLAG,
-                CATEGORY_TYPE_FLAG,
-            ]:
-                continue
-
-            # Process each group (non-traceable outer loop, but computed during init)
-            for group_val in self.unique_groups:
-                group_key = float(group_val)
-                indices = self.group_indices.get(group_key, [])
-                if len(indices) == 0:
-                    continue
-
-                # Extract transformed data for this group
-                transformed_data = transformed_values[result_idx]
-                group_data = transformed_data[indices]
-
-                # Update result values - one position at a time (traceable)
-                for i, idx in enumerate(indices):
-                    result_values = result_values.at[idx, col_idx].set(group_data[i])
-
-            result_idx += 1
+        # Create the core data for transformation
+        transformed_values = self._transform_core(self.df._values, func)
 
         # Create result DataFrame
-        result_df = DataFrame({})
-        result_df._column_names = self.df._column_names.copy()
-        result_df._column_mapping = self.df._column_mapping.copy()
-        result_df._values = result_values
+        result = DataFrame.__new__(DataFrame)
 
-        # Copy metadata
-        for col, metadata in self.df._column_metadata.items():
-            result_df._column_metadata[col] = metadata.copy()
+        # Copy index information
+        result._index_columns = self.df._index_columns.copy()
+        result._index_values = {k: v.copy() for k, v in self.df._index_values.items()}
+        result._index_mappings = {
+            k: v.copy() for k, v in self.df._index_mappings.items()
+        }
+        result._index_sizes = self.df._index_sizes.copy()
 
-        return result_df
+        # Copy column information
+        result._column_names = self.df._column_names.copy()
+        result._column_mapping = self.df._column_mapping.copy()
+        result._column_dtypes = self.df._column_dtypes.copy()
 
-    def _aggregate_core(
-        self, core_data: List[jax.Array], func: Callable
-    ) -> List[jax.Array]:
-        """
-        Pure JAX function for computing aggregations within groups.
+        # Copy metadata but ensure index columns have metadata even if they're not data columns
+        result._column_metadata = {
+            k: v.copy() for k, v in self.df._column_metadata.items()
+        }
 
-        Args:
-            core_data: List of JAX arrays to aggregate
-            func: A JAX-compatible reduction function
-
-        Returns:
-            List of JAX arrays with aggregated values
-        """
-        agg_results = []
-        for data in core_data:
-            # For regular columns, apply aggregation to each group directly
-            # This avoids the complex chain of jax.lax.cond operations in the previous
-            # implementation
-            col_data = data
-
-            # Process each group (non-traceable loop, but known at initialization time)
-            group_results = []
-            for _, group in enumerate(self.unique_groups):
-                group_float = float(group)
-                indices = self.group_indices.get(group_float, [])
-
-                if len(indices) == 0:
-                    # Empty group - use NaN
-                    group_results.append(jnp.nan)
+        # Make sure all index columns have metadata
+        for col in result._index_columns:
+            if col not in result._column_metadata:
+                # If the index column doesn't have metadata yet, add default metadata
+                # based on its type
+                if pd.api.types.is_datetime64_any_dtype(
+                    pd.Series(result._index_values[col])
+                ):
+                    result._column_metadata[col] = {"dtype_flag": DATETIME_TYPE_FLAG}
+                elif any(isinstance(x, str) for x in result._index_values[col]):
+                    # For string types
+                    unique_vals = sorted(set(str(v) for v in result._index_values[col]))
+                    result._column_metadata[col] = {
+                        "dtype_flag": CATEGORY_TYPE_FLAG,
+                        "category_map": {i: val for i, val in enumerate(unique_vals)},
+                    }
                 else:
-                    # Extract data for this group (fixed size, known at this point)
-                    group_data = col_data[indices]
+                    # Default metadata for numeric types
+                    result._column_metadata[col] = {"dtype_flag": None}
 
-                    # Apply aggregation function (traceable inner operation)
-                    group_results.append(func(group_data))
+        # Set transformed values
+        result._values = transformed_values
 
-            agg_results.append(jnp.array(group_results))
+        return result
 
-        return agg_results
-
-    def _transformation_core(
-        self, core_data: List[jax.Array], func: Callable
-    ) -> List[jax.Array]:
+    def _transform_core(self, values: jax.Array, func: Callable) -> jax.Array:
         """
-        Pure JAX function for computing transformations within groups.
+        Core transformation logic using JAX operations.
+
+        This implementation leverages the Cartesian product structure to make
+        group operations fully traceable. Since we know the exact size and
+        structure of each group, we can use fixed slicing patterns instead
+        of boolean indexing.
 
         Args:
-            core_data: List of JAX arrays to transform
-            func: A JAX-compatible transformation function
+            values: Data values (n_rows × n_cols)
+            func: Function to apply to each group
 
         Returns:
-            List of JAX arrays with transformed values
-        """
-        transformed_values = []
-        for col_data in core_data:
-            # Process each group (non-traceable outer loop, but computed during init)
-            group_results = []
-            for group_val in self.unique_groups:
-                group_key = float(group_val)
-                indices = self.group_indices.get(group_key, [])
-                if len(indices) == 0:
-                    # Empty group - use empty array
-                    group_results.append(jnp.array([]))
-                    continue
-
-                # Extract data for this group (fixed size for this group, known here)
-                group_data = col_data[indices]
-
-                # Apply transformation (fully traceable inner operation)
-                transformed_data = func(group_data)
-                group_results.append(transformed_data)
-
-            transformed_values.append(jnp.concatenate(group_results))
-
-        return transformed_values
-
-    # Helper methods for special column types
-    def to_datetime(self) -> pd.Series:
-        """
-        Convert the groupby column to pandas datetime if it's a datetime column.
-        NON-TRACEABLE: Uses pandas conversion
-        """
-        if (
-            isinstance(self.by, str)
-            and self.by_metadata["dtype_flag"] == DATETIME_TYPE_FLAG
-        ):
-            return pd.Series(ns_to_pd_datetime(self.grouping_values))
-        else:
-            raise TypeError("Groupby column is not a datetime type")
-
-    def to_strings(self) -> pd.Series:
-        """
-        Convert the groupby column to strings if it's a categorical column.
-        NON-TRACEABLE: Uses pandas conversion
-        """
-        if (
-            isinstance(self.by, str)
-            and self.by_metadata["dtype_flag"] == CATEGORY_TYPE_FLAG
-        ):
-            cat_map = self.by_metadata["category_map"]
-            assert cat_map is not None
-            return pd.Series(
-                [
-                    cat_map.get(int(x), None) if x != -1 and not jnp.isnan(x) else None
-                    for x in self.unique_groups
-                ]
-            )
-        else:
-            raise TypeError("Groupby column is not a categorical type")
-
-
-class GroupByRolling:
-    """Represents a rolling window operation on a grouped dataframe (Maximally traceable
-    implementation)."""
-
-    def __init__(self, groupby: GroupBy, window_size: int):
-        """
-        Initialize a rolling window object for grouped data.
-
-        Args:
-            groupby: The JaxGroupBy object
-            window_size: Size of each window
-        """
-        # NON-TRACEABLE SECTION: Initialization and data preparation
-        self.groupby = groupby
-        self.window_size = window_size
-
-        # Pre-compute column masks for special types during initialization
-        self.column_masks = []
-        for col_name in self.groupby.df._column_names:
-            metadata = self.groupby.df._column_metadata[col_name]
-            # Only process non-special columns
-            should_process = metadata["dtype_flag"] not in [
-                DATETIME_TYPE_FLAG,
-                CATEGORY_TYPE_FLAG,
-            ]
-            self.column_masks.append(should_process)
-
-        # Convert to JAX array for use in traceable computation
-        self.process_mask_array = jnp.array(self.column_masks)
-
-    def apply(self, func: Callable) -> DataFrame:
-        """
-        Apply a JAX function to rolling windows within each group.
-
-        Args:
-            func: A JAX-compatible function to apply to each window
-
-        Returns:
-            JaxDataFrame: Result of applying the function
-        """
-        # NON-TRACEABLE SECTION: Gather necessary data for computation
-        df_values = self.groupby.df._values
-        group_ids = self.groupby.group_ids
-        unique_groups = self.groupby.unique_groups
-        window_size = self.window_size
-        process_mask = self.process_mask_array
-
-        # CORE COMPUTATION PHASE (FULLY TRACEABLE)
-        # This pure function call can be traced end-to-end by JAX
-        result_values = self._compute_grouped_rolling_core(
-            df_values, group_ids, unique_groups, process_mask, window_size, func
-        )
-
-        # NON-TRACEABLE SECTION: Create result dataframe
-        result_df = DataFrame({})
-        result_df._column_names = self.groupby.df._column_names.copy()
-        result_df._column_mapping = self.groupby.df._column_mapping.copy()
-        result_df._values = result_values
-
-        # Copy column metadata
-        for col, metadata in self.groupby.df._column_metadata.items():
-            result_df._column_metadata[col] = metadata.copy()
-
-        return result_df
-
-    def _compute_grouped_rolling_core(  # noqa: PLR0913
-        self,
-        values: jax.Array,
-        group_ids: jax.Array,
-        unique_groups: jax.Array,
-        process_mask: jax.Array,
-        window_size: int,
-        func: Callable,
-    ) -> jax.Array:
-        """
-        Pure JAX function for computing rolling windows grouped by IDs. Fully traceable.
-
-        Args:
-            values: 2D JAX array of input values
-            group_ids: 1D JAX array mapping each row to its group ID
-            unique_groups: 1D JAX array of unique group IDs
-            process_mask: Boolean mask indicating which columns to process
-            window_size: Size of the rolling window
-            func: JAX-compatible function to apply to each window
-
-        Returns:
-            2D JAX array of results with same shape as input
+            Transformed values (n_rows × n_cols)
         """
         n_rows, n_cols = values.shape
 
-        # Define column-wise processing function (will be vmapped)
-        def process_column(col_idx):
-            col_data = values[:, col_idx]
-            should_process = process_mask[col_idx]
+        # Initialize result array
+        result = jnp.zeros_like(values)
 
-            # Define row-wise window function (will be vmapped)
-            def process_row(row_idx):
-                # Get the group ID for this row
-                row_group_id = group_ids[row_idx]
+        # Process each group
+        for group_idx in range(self.n_groups):
+            # Process each column
+            for col_idx in range(n_cols):
+                # Skip special column types
+                col_name = self.df._column_names[col_idx]
+                col_metadata = self.df._column_metadata.get(col_name, {})
+                if col_metadata.get("dtype_flag") in [
+                    DATETIME_TYPE_FLAG,
+                    CATEGORY_TYPE_FLAG,
+                ]:
+                    # For special types, copy the original values
+                    if group_idx == 0:  # Only copy once
+                        result = result.at[:, col_idx].set(values[:, col_idx])
+                    continue
 
-                # Find all rows in the same group
-                same_group_mask = group_ids == row_group_id
+                # Gather all values for this group
+                group_values = jnp.zeros(self.group_size)
 
-                # Special handling for invalid groups (-1)
-                valid_group = row_group_id >= 0
-
-                # Calculate the relative position of this row within its group
-                # Count how many elements with the same group ID appear before this row
-                relative_pos_mask = jnp.logical_and(
-                    same_group_mask, jnp.arange(n_rows) <= row_idx
-                )
-                relative_pos = jnp.sum(relative_pos_mask) - 1  # 0-based index
-
-                # Create a window buffer of fixed size
-                window_buffer = jnp.zeros(window_size, dtype=col_data.dtype)
-                valid_mask = jnp.zeros(window_size, dtype=jnp.bool_)
-
-                # Calculate start position for the window
-                start_pos = jnp.maximum(0, relative_pos - window_size + 1)
-
-                # Fill the buffer with values from the same group
-                def fill_window(i, carry):
-                    buffer, mask = carry
-
-                    # Calculate the position in the group
-                    group_pos = start_pos + i
-
-                    # Find the absolute position in the data
-                    # This is non-trivial and requires counting
-                    count_mask = jnp.logical_and(
-                        same_group_mask, jnp.arange(n_rows) < n_rows
-                    )
-                    abs_positions = jnp.cumsum(count_mask) - 1
-                    valid_positions = jnp.where(same_group_mask, abs_positions, -1)
-
-                    # Find the position where group_pos appears
-                    position_mask = jnp.logical_and(
-                        valid_positions >= 0, valid_positions == group_pos
+                # Fill group values
+                for i in range(self.group_size):
+                    # Calculate the row index for this group and offset
+                    # For a Cartesian product, the groups are arranged in blocks
+                    # with a stride determined by the position of the groupby column
+                    row_idx = (
+                        (group_idx * self.stride)
+                        + (i % self.stride)
+                        + (i // self.stride * self.stride * self.n_groups)
                     )
 
-                    # Check if this position exists and is valid
-                    pos_exists = jnp.any(position_mask)
-                    abs_pos = jnp.where(pos_exists, jnp.argmax(position_mask), -1)
+                    # Check bounds
+                    if row_idx < n_rows:
+                        group_values = group_values.at[i].set(values[row_idx, col_idx])
 
-                    # Element is valid if position exists and is within bounds
-                    valid = jnp.logical_and(
-                        pos_exists,
-                        jnp.logical_and(group_pos >= 0, group_pos <= relative_pos),
+                # Apply the transformation function
+                transformed = func(group_values)
+
+                # Scatter the transformed values back
+                for i in range(self.group_size):
+                    row_idx = (
+                        (group_idx * self.stride)
+                        + (i % self.stride)
+                        + (i // self.stride * self.stride * self.n_groups)
                     )
+                    if row_idx < n_rows:
+                        result = result.at[row_idx, col_idx].set(transformed[i])
 
-                    # Get value or use 0 if invalid
-                    value = jnp.where(valid, col_data[abs_pos], 0.0)
+        return result
 
-                    # Update buffer and mask
-                    new_buffer = buffer.at[i].set(value)
-                    new_mask = mask.at[i].set(valid)
-
-                    return (new_buffer, new_mask)
-
-                # Loop through window positions using fori_loop (traceable)
-                buffer, mask = jax.lax.fori_loop(
-                    0, window_size, fill_window, (window_buffer, valid_mask)
-                )
-
-                # Check if we have any valid elements
-                valid_count = jnp.sum(mask)
-
-                # Different NaN handling based on window size:
-                # For window_size=2, we need first element to be original value
-                # For window_size>=3, we return NaN for the first (win_size-1) elements
-                # This makes handling work consistently for the test cases
-                window_is_incomplete = jnp.where(
-                    window_size == 2,  # noqa: PLR2004
-                    # For window_size=2, only consider position 0 incomplete in groups
-                    #  with >1 element
-                    jnp.logical_and(relative_pos == 0, valid_count > 1),
-                    # For window_size>=3, regular pandas-style handling
-                    relative_pos < window_size - 1,
-                )
-
-                # Handle the case where group is invalid, window is incomplete,
-                # or no valid elements
-                def apply_func(_, buffer=buffer, mask=mask):
-                    # Apply the function to masked values
-                    masked_values = jnp.where(mask, buffer, jnp.nan)
-                    return func(masked_values)
-
-                # Use nested lax.cond for maximum traceability
-                result = jax.lax.cond(
-                    valid_group,  # First check if group is valid
-                    lambda _: jax.lax.cond(
-                        window_is_incomplete,
-                        lambda _: jnp.where(
-                            window_size == 2,  # noqa: PLR2004
-                            col_data[row_idx],
-                            jnp.nan,
-                        ),  # For window_size=2 first element is original, otherwise NaN
-                        apply_func,  # Apply function if we have a complete window
-                        None,
-                    ),
-                    lambda _: col_data[row_idx],  # Return original if invalid group
-                    None,
-                )
-
-                return result
-
-            # Process all rows in this column using vmap
-            positions = jnp.arange(n_rows)
-            processed = jax.vmap(process_row)(positions)
-
-            # Only update columns that should be processed
-            # For special columns (datetime/category), keep original values
-            return jnp.where(should_process, processed, col_data)
-
-        # Process all columns using vmap
-        column_indices = jnp.arange(n_cols)
-        result_columns = jax.vmap(process_column)(column_indices)
-
-        # Transpose to get back to (rows, cols) shape
-        return jnp.transpose(result_columns)  # type: ignore
-
-    def aggregate(self, func: Callable) -> DataFrame:
+    def aggregate(self, func: Callable) -> pd.DataFrame:
         """
-        Apply an aggregation function to each rolling window within each group.
+        Apply an aggregation function to each group.
+
+        This method is fully traceable and can be used in JIT-compiled functions.
+        The result is a pandas DataFrame for easy viewing and further processing.
 
         Args:
-            func: A JAX-compatible aggregation function for each window
+            func: Aggregation function
 
         Returns:
-            JaxDataFrame: Same shape as input with each value replaced by its window
-             aggregation
+            pandas DataFrame with one row per group
         """
-        return self.apply(func)
+        # Compute aggregated values
+        agg_values = self._aggregate_core(self.df._values, func)
+
+        # Create pandas DataFrame
+        return pd.DataFrame(
+            agg_values, index=self.values, columns=self.df._column_names
+        )
+
+    def _aggregate_core(self, values: jax.Array, func: Callable) -> jax.Array:
+        """
+        Core aggregation logic using JAX operations.
+
+        Args:
+            values: Data values (n_rows × n_cols)
+            func: Function to apply to each group
+
+        Returns:
+            Aggregated values (n_groups × n_cols)
+        """
+        n_rows, n_cols = values.shape
+
+        # Initialize result array
+        result = jnp.zeros((self.n_groups, n_cols))
+
+        # Process each group
+        for group_idx in range(self.n_groups):
+            # Process each column
+            for col_idx in range(n_cols):
+                # Skip special column types
+                col_name = self.df._column_names[col_idx]
+                col_metadata = self.df._column_metadata.get(col_name, {})
+                if col_metadata.get("dtype_flag") in [
+                    DATETIME_TYPE_FLAG,
+                    CATEGORY_TYPE_FLAG,
+                ]:
+                    # For special types, use the first value in the group
+                    row_idx = group_idx * self.stride
+                    if row_idx < n_rows:
+                        result = result.at[group_idx, col_idx].set(
+                            values[row_idx, col_idx]
+                        )
+                    continue
+
+                # Gather all values for this group
+                group_values = jnp.zeros(self.group_size)
+
+                # Fill group values
+                for i in range(self.group_size):
+                    # Calculate the row index for this group and offset
+                    row_idx = (
+                        (group_idx * self.stride)
+                        + (i % self.stride)
+                        + (i // self.stride * self.stride * self.n_groups)
+                    )
+
+                    # Check bounds
+                    if row_idx < n_rows:
+                        group_values = group_values.at[i].set(values[row_idx, col_idx])
+
+                # Apply the aggregation function
+                agg_value = func(group_values)
+
+                # Store the result
+                result = result.at[group_idx, col_idx].set(agg_value)
+
+        return result
+
+
+# Register CartesianDataFrame as a pytree
+def _dataframe_tree_flatten(
+    df: DataFrame,
+) -> Tuple[List[jax.Array], Dict[str, Any]]:
+    """Flatten CartesianDataFrame for JAX tracing."""
+    # Extract traceable arrays
+    leaves = [df._values]
+
+    # Extract metadata
+    aux_data = {
+        "column_names": df._column_names,
+        "column_mapping": df._column_mapping,
+        "column_dtypes": df._column_dtypes,
+        "column_metadata": df._column_metadata,
+        "index_columns": df._index_columns,
+        "index_values": df._index_values,
+        "index_mappings": df._index_mappings,
+        "index_sizes": df._index_sizes,
+    }
+
+    return leaves, aux_data
+
+
+def _dataframe_tree_unflatten(
+    aux_data: Dict[str, Any], leaves: List[jax.Array]
+) -> DataFrame:
+    """Reconstruct CartesianDataFrame from traced arrays."""
+    # Create new CartesianDataFrame
+    result = DataFrame.__new__(DataFrame)
+
+    # Set values
+    result._values = leaves[0]
+
+    # Set metadata
+    result._column_names = aux_data["column_names"]
+    result._column_mapping = aux_data["column_mapping"]
+    result._column_dtypes = aux_data["column_dtypes"]
+    result._column_metadata = aux_data["column_metadata"]
+    result._index_columns = aux_data["index_columns"]
+    result._index_values = aux_data["index_values"]
+    result._index_mappings = aux_data["index_mappings"]
+    result._index_sizes = aux_data["index_sizes"]
+
+    return result
+
+
+# Register CartesianGroupBy as a pytree
+def _groupby_tree_flatten(gb: GroupBy) -> Tuple[List[Any], Dict[str, Any]]:
+    """Flatten CartesianGroupBy for JAX tracing."""
+    # No direct leaves, but we reference the dataframe
+    leaves = []
+
+    # Extract metadata
+    aux_data = {
+        "df": gb.df,
+        "by": gb.by,
+        "values": gb.values,
+        "n_groups": gb.n_groups,
+        "group_size": gb.group_size,
+        "stride": gb.stride,
+        "_strides": gb._strides,
+    }
+
+    return leaves, aux_data
+
+
+def _groupby_tree_unflatten(aux_data: Dict[str, Any], leaves: List[Any]) -> GroupBy:
+    """Reconstruct CartesianGroupBy from traced arrays."""
+    # Create new CartesianGroupBy
+    result = GroupBy.__new__(GroupBy)
+
+    # Set metadata
+    result.df = aux_data["df"]
+    result.by = aux_data["by"]
+    result.values = aux_data["values"]
+    result.n_groups = aux_data["n_groups"]
+    result.group_size = aux_data["group_size"]
+    result.stride = aux_data["stride"]
+    result._strides = aux_data["_strides"]
+
+    return result
+
+
+# Register both classes as pytrees
+register_pytree_node(DataFrame, _dataframe_tree_flatten, _dataframe_tree_unflatten)
+register_pytree_node(GroupBy, _groupby_tree_flatten, _groupby_tree_unflatten)

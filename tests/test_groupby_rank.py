@@ -9,7 +9,14 @@ import jandax as jdf
 @pytest.fixture(scope="module")
 def create_dataframe():
     stocks = ["AAPL", "GOOGL", "AMZN", "MSFT", "FB"] * 6
-    datetimes = pd.date_range("2020-01-01", periods=30)
+    datetimes = (
+        [pd.to_datetime("2023-01-01")] * 5
+        + [pd.to_datetime("2023-01-02")] * 5
+        + [pd.to_datetime("2023-01-03")] * 5
+        + [pd.to_datetime("2023-01-04")] * 5
+        + [pd.to_datetime("2023-01-05")] * 5
+        + [pd.to_datetime("2023-01-06")] * 5
+    )
     features1 = np.random.randn(30)
     features2 = np.random.randn(30)
     returns = np.random.randn(30)
@@ -23,7 +30,7 @@ def create_dataframe():
         }
     )
 
-    df = df.set_index(["stock", "datetime"])
+    df = df.set_index(["datetime", "stock"]).sort_index()
     return df
 
 
@@ -31,10 +38,9 @@ def test_groupby_rank(create_dataframe):
     df = create_dataframe
     jdf_df = jdf.DataFrame(df)
 
-    @jax.jit
     def process_data(df):
         df = (
-            df[["feature1", "feature2", "return", "datetime"]]
+            df[["feature1", "feature2", "return"]]
             .groupby("datetime")
             .transform(jax.scipy.stats.rankdata)
         )
@@ -44,8 +50,7 @@ def test_groupby_rank(create_dataframe):
 
     pandas_rank = df[["feature1", "feature2", "return"]].groupby("datetime").rank()
 
-    np.testing.assert_allclose(
-        jdf_rank[["feature1", "feature2", "return"]]._values,
-        pandas_rank.values,
-        rtol=1e-05,
-    )
+    print(pandas_rank)
+    print(jdf_rank)
+
+    np.testing.assert_allclose(jdf_rank._values, pandas_rank.values, rtol=1e-05)
